@@ -1,0 +1,31 @@
+name: middle_out
+description: Middle Out — lossless file compression into visual frames. A file encodes into QR-like frames packaged as a PDF; decoding the PDF reconstructs the original bit-for-bit.
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.6.0 <4.0.0'
+  flutter: '>=3.27.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # SHA-256 + HMAC (PBKDF2 key derivation).
+  crypto: ^3.0.6
+  # zlib compression that works on mobile and web (dart:io ZLibCodec is
+  # not available on web).
+  archive: ^4.0.7
+  # Encoded-PDF assembly: 1 cover page + 1 full-page code page per frame.
+  pdf: ^3.11.3
+  # File picking on mobile, desktop and web.
+  file_picker: ^8.1.6
+  # App documents directory for saving encoded PDFs on native platforms.
+  path_provider: ^2.1.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true

@@ -1,0 +1,248 @@
+import 'dart:typed_data';
+
+import 'frame.dart';
+
+/// The visual codes: a Middle Out Code grid (2D) and a stacked-row barcode.
+///
+/// A real ISO QR code holds ~3 KB; a Middle Out frame holds up to 64 KiB,
+/// so the 2D mode is a custom grid — QR-style finders, timing patterns and
+/// a centre tile reserved for the logo — rather than an ISO QR code.
+/// Barcode mode stacks the payload as rows of bars, PDF417-style.
+///
+/// Both formats carry a 4-byte big-endian length prefix so the parser knows
+/// where the payload ends and the padding begins. Geometry mirrors
+/// `reference/codec_reference.py` exactly.
+///
+/// Matrices are `List<Uint8List>` rows of 0 (white) / 1 (black) modules.
+class CodeGrid {
+  static const int minSize = 32;
+  static const int step = 4;
+  static const int quietModules = 4;
+
+  static const int barcodeRowBytes = 64;
+
+  // --- Grid geometry -------------------------------------------------------
+
+  static Set<(int, int)> _finderCells(int n) {
+    final cells = <(int, int)>{};
+    for (final (r0, c0) in [(0, 0), (0, n - 8), (n - 8, 0)]) {
+      for (var r = r0; r < r0 + 8; r++) {
+        for (var c = c0; c < c0 + 8; c++) {
+          cells.add((r, c));
+        }
+      }
+    }
+    return cells;
+  }
+
+  static Set<(int, int)> _timingCells(int n) {
+    final cells = <(int, int)>{};
+    for (var i = 8; i < n - 8; i++) {
+      cells.add((6, i));
+      cells.add((i, 6));
+    }
+    return cells;
+  }
+
+  /// (startRow, startCol, side) of the logo tile: centred, side = n//4.
+  static (int, int, int) centreTile(int n) {
+    final side = n ~/ 4 < 8 ? 8 : n ~/ 4;
+    final start = (n - side) ~/ 2;
+    return (start, start, side);
+  }
+
+  static Set<(int, int)> _centreCells(int n) {
+    final (r0, c0, side) = centreTile(n);
+    final cells = <(int, int)>{};
+    for (var r = r0; r < r0 + side; r++) {
+      for (var c = c0; c < c0 + side; c++) {
+        cells.add((r, c));
+      }
+    }
+    return cells;
+  }
+
+  static Set<(int, int)> _reservedCells(int n) =>
+      _finderCells(n).union(_timingCells(n)).union(_centreCells(n));
+
+  static int gridCapacityBits(int n) => n * n - _reservedCells(n).length;
+
+  static int chooseGridSize(int payloadLength) {
+    final needBits = (payloadLength + 4) * 8;
+    var n = minSize;
+    while (gridCapacityBits(n) < needBits) {
+      n += step;
+      if (n > 4096) {
+        throw const CodecException('payload too large for a single code grid');
+      }
+    }
+    return n;
+  }
+
+  /// Renders [payload] into an n x n module matrix.
+  static List<Uint8List> buildGrid(Uint8List payload) {
+    final blob = BytesBuilder()
+      ..add(
+        (ByteData(4)..setUint32(0, payload.length)).buffer.asUint8List(),
+      )
+      ..add(payload);
+    final bytes = blob.toBytes();
+    final n = chooseGridSize(payload.length);
+    final grid = List<Uint8List>.generate(n, (_) => Uint8List(n));
+    final reserved = _reservedCells(n);
+
+    // Finder patterns: 7x7, outer ring black, middle ring white, 3x3 core.
+    for (final (r0, c0) in [(0, 0), (0, n - 7), (n - 7, 0)]) {
+      for (var dr = 0; dr < 7; dr++) {
+        for (var dc = 0; dc < 7; dc++) {
+          final onRing = dr == 0 || dr == 6 || dc == 0 || dc == 6;
+          final inCore = dr >= 2 && dr <= 4 && dc >= 2 && dc <= 4;
+          grid[r0 + dr][c0 + dc] = (onRing || inCore) ? 1 : 0;
+        }
+      }
+    }
+    // Timing row/column 6, alternating starting black.
+    for (var i = 8; i < n - 8; i++) {
+      grid[6][i] = i % 2 == 0 ? 1 : 0;
+      grid[i][6] = i % 2 == 0 ? 1 : 0;
+    }
+
+    // Data bits, row-major over the placeable cells, MSB first.
+    var bitIndex = 0;
+    final totalBits = bytes.length * 8;
+    for (var r = 0; r < n; r++) {
+      for (var c = 0; c < n; c++) {
+        if (reserved.contains((r, c))) continue;
+        if (bitIndex >= totalBits) return grid;
+        final byte = bytes[bitIndex ~/ 8];
+        grid[r][c] = (byte >> (7 - bitIndex % 8)) & 1;
+        bitIndex++;
+      }
+    }
+    return grid;
+  }
+
+  /// Inverse of [buildGrid]: reads the length prefix, then the payload.
+  static Uint8List parseGrid(List<Uint8List> grid) {
+    final n = grid.length;
+    final reserved = _reservedCells(n);
+    final bits = <int>[];
+    for (var r = 0; r < n; r++) {
+      for (var c = 0; c < n; c++) {
+        if (!reserved.contains((r, c))) bits.add(grid[r][c]);
+      }
+    }
+    if (bits.length < 32) {
+      throw const CodecException('grid too small to hold a length prefix');
+    }
+    var length = 0;
+    for (var i = 0; i < 32; i++) {
+      length = (length << 1) | bits[i];
+    }
+    if (length * 8 + 32 > bits.length) {
+      throw const CodecException('grid length prefix exceeds grid capacity');
+    }
+    final out = Uint8List(length);
+    for (var i = 0; i < length; i++) {
+      var byte = 0;
+      for (var k = 0; k < 8; k++) {
+        byte = (byte << 1) | bits[32 + i * 8 + k];
+      }
+      out[i] = byte;
+    }
+    return out;
+  }
+
+  // --- Stacked-row barcode -------------------------------------------------
+
+  /// Row layout (bars, 1 = black): [4 start guard][8 row index]
+  /// [512 data][4 stop guard] = 528 bars per row.
+  static const int barcodeRowBars = 4 + 8 + barcodeRowBytes * 8 + 4;
+
+  static List<Uint8List> buildBarcodeRows(Uint8List payload) {
+    final blob = BytesBuilder()
+      ..add(
+        (ByteData(4)..setUint32(0, payload.length)).buffer.asUint8List(),
+      )
+      ..add(payload);
+    final bytes = blob.toBytes();
+    final rowCount =
+        (bytes.length + barcodeRowBytes - 1) ~/ barcodeRowBytes;
+    final rows = <Uint8List>[];
+    for (var rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+      final chunk = Uint8List(barcodeRowBytes);
+      final start = rowIndex * barcodeRowBytes;
+      final end = (start + barcodeRowBytes).clamp(0, bytes.length);
+      chunk.setAll(0, bytes.sublist(start, end));
+      final bars = Uint8List(barcodeRowBars);
+      bars[0] = 1;
+      bars[1] = 1;
+      bars[2] = 1;
+      bars[3] = 1;
+      for (var k = 0; k < 8; k++) {
+        bars[4 + k] = (rowIndex >> (7 - k)) & 1;
+      }
+      for (var i = 0; i < barcodeRowBytes; i++) {
+        for (var k = 0; k < 8; k++) {
+          bars[12 + i * 8 + k] = (chunk[i] >> (7 - k)) & 1;
+        }
+      }
+      bars[barcodeRowBars - 4] = 1;
+      bars[barcodeRowBars - 3] = 1;
+      bars[barcodeRowBars - 2] = 1;
+      bars[barcodeRowBars - 1] = 1;
+      rows.add(bars);
+    }
+    return rows;
+  }
+
+  /// Inverse of [buildBarcodeRows]. Rows are reassembled by their index,
+  /// so a scan that reads them out of order still decodes.
+  static Uint8List parseBarcodeRows(List<Uint8List> rows) {
+    if (rows.isEmpty) {
+      throw const CodecException('no barcode rows');
+    }
+    if (rows.first.length != barcodeRowBars) {
+      throw CodecException(
+        'unexpected barcode row width ${rows.first.length}',
+      );
+    }
+    final chunks = <int, Uint8List>{};
+    for (final bars in rows) {
+      if (bars[0] != 1 ||
+          bars[1] != 1 ||
+          bars[2] != 1 ||
+          bars[3] != 1 ||
+          bars[barcodeRowBars - 4] != 1 ||
+          bars[barcodeRowBars - 3] != 1 ||
+          bars[barcodeRowBars - 2] != 1 ||
+          bars[barcodeRowBars - 1] != 1) {
+        throw const CodecException('barcode row guard pattern missing');
+      }
+      var index = 0;
+      for (var k = 0; k < 8; k++) {
+        index = (index << 1) | bars[4 + k];
+      }
+      final data = Uint8List(barcodeRowBytes);
+      for (var i = 0; i < barcodeRowBytes; i++) {
+        var byte = 0;
+        for (var k = 0; k < 8; k++) {
+          byte = (byte << 1) | bars[12 + i * 8 + k];
+        }
+        data[i] = byte;
+      }
+      chunks[index] = data;
+    }
+    final sorted = chunks.keys.toList()..sort();
+    final blob = BytesBuilder();
+    for (final index in sorted) {
+      blob.add(chunks[index]!);
+    }
+    final bytes = blob.toBytes();
+    final length = ByteData.sublistView(bytes, 0, 4).getUint32(0);
+    if (length + 4 > bytes.length) {
+      throw const CodecException('barcode length prefix exceeds payload');
+    }
+    return Uint8List.sublistView(bytes, 4, 4 + length);
+  }
+}
