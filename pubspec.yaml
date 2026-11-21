@@ -21,6 +21,15 @@ dependencies:
   file_picker: ^8.1.6
   # App documents directory for saving encoded PDFs on native platforms.
   path_provider: ^2.1.4
+  # Local persistence: history, settings, account, batch queue metadata.
+  shared_preferences: ^2.2.0
+  # System share sheet for encoded PDFs, rebuilt files and links.
+  share_plus: ^10.0.0
+  # Camera preview + capture for the scan screen (sampling is phase 2).
+  camera: ^0.11.0
+  # App logo assets (SVG) and UI type.
+  flutter_svg: ^2.0.0
+  google_fonts: ^6.2.0
 
 dev_dependencies:
   flutter_test:
@@ -29,3 +38,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/logos/

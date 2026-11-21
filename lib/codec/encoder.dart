@@ -12,6 +12,7 @@ import 'frame.dart';
 
 /// Statistics for a completed encode.
 class EncodeStats {
+  /// Creates encode statistics.
   const EncodeStats({
     required this.originalSize,
     required this.compressedSize,
@@ -20,25 +21,41 @@ class EncodeStats {
     required this.sha256Hex,
   });
 
+  /// Bytes of the original file.
   final int originalSize;
+
+  /// Bytes of the compressed (+encrypted) stream.
   final int compressedSize;
+
+  /// Frames in the encode (data + parity).
   final int frameCount;
+
+  /// 8-frame groups in the encode.
   final int groupCount;
+
+  /// SHA-256 hex of the original file.
   final String sha256Hex;
 
+  /// Compression ratio (original / compressed).
   double get ratio => originalSize / compressedSize.clamp(1, compressedSize);
 }
 
 /// The result of an encode: frames ready to render, plus stats.
 class EncodeResult {
+  /// Creates an encode result.
   const EncodeResult({
     required this.frames,
     required this.stats,
     required this.barcode,
   });
 
+  /// Frames ready to render (data + parity, group order).
   final List<Frame> frames;
+
+  /// Encode statistics.
   final EncodeStats stats;
+
+  /// True when the frames render as stacked barcodes.
   final bool barcode;
 }
 
@@ -47,10 +64,11 @@ class EncodeResult {
 /// Pipeline: SHA-256 -> zlib-9 compress -> (optional ChaCha20 encrypt) ->
 /// split into <= [maxPayload] chunks -> group into 6 DATA + 2 XOR-parity.
 ///
-/// The encoder works on bytes already in memory. Streaming a 100 GB file
-/// through this pipeline chunk-by-chunk (without ever holding it whole) is
-/// the v0.2 milestone; v0.1 enforces the platform limit BEFORE reading so
-/// a file larger than the mode allows is routed, never loaded.
+/// [encode] works on bytes already in memory. [StreamingEncoder] runs the
+/// same pipeline chunk-by-chunk off disk for large native files; both
+/// share [buildFrames], so a streamed encode is byte-identical in framing
+/// to an in-memory one (compression output may differ by chunking, which
+/// is fine — zlib streams are self-describing).
 class Encoder {
   /// Encodes [data]. Pass [passphrase] to encrypt (default ON in the UI);
   /// pass null for a plain encode whose payload is human-readable.
@@ -91,7 +109,49 @@ class Encoder {
     }
     if (chunks.isEmpty) chunks.add(Uint8List(0));
 
-    final totalData = chunks.length;
+    final frames = buildFrames(
+      chunks: chunks,
+      sha256Bytes: sha,
+      originalSize: data.length,
+      compressedSize: stream.length,
+      salt: salt,
+      nonce: nonce,
+      encrypted: encrypted,
+      barcode: barcode,
+    );
+    final totalGroups =
+        (chunks.length + kGroupDataFrames - 1) ~/ kGroupDataFrames;
+    return EncodeResult(
+      frames: frames,
+      stats: EncodeStats(
+        originalSize: data.length,
+        compressedSize: stream.length,
+        frameCount: frames.length,
+        groupCount: totalGroups,
+        sha256Hex: sha.map((b) => b.toRadixString(16).padLeft(2, '0')).join(),
+      ),
+      barcode: barcode,
+    );
+  }
+
+  /// Frames a compressed (+encrypted) stream given as [chunks].
+  ///
+  /// Shared by [encode] and [StreamingEncoder]: the frame layout, header
+  /// fields, parity construction and frame-index assignment are identical
+  /// whichever path produced the stream. Throws [CodecException] when the
+  /// encode would need more than [kMaxFrames] frames.
+  static List<Frame> buildFrames({
+    required List<Uint8List> chunks,
+    required Uint8List sha256Bytes,
+    required int originalSize,
+    required int compressedSize,
+    required Uint8List salt,
+    required Uint8List nonce,
+    required bool encrypted,
+    required bool barcode,
+  }) {
+    final dataChunks = chunks.isEmpty ? [Uint8List(0)] : chunks;
+    final totalData = dataChunks.length;
     final totalGroups = (totalData + kGroupDataFrames - 1) ~/ kGroupDataFrames;
     final totalFrames = totalData + totalGroups * kGroupParityFrames;
     if (totalFrames > kMaxFrames) {
@@ -121,9 +181,9 @@ class Encoder {
           flags: flags,
           totalGroups: totalGroups,
           totalDataFrames: totalData,
-          originalSize: data.length,
-          compressedSize: stream.length,
-          originalSha256: sha,
+          originalSize: originalSize,
+          compressedSize: compressedSize,
+          originalSha256: sha256Bytes,
           salt: salt,
           nonce: nonce,
           payload: payload,
@@ -131,9 +191,9 @@ class Encoder {
 
     final frames = <Frame>[];
     for (var group = 0; group < totalGroups; group++) {
-      final groupChunks = chunks.sublist(
+      final groupChunks = dataChunks.sublist(
         group * kGroupDataFrames,
-        math.min((group + 1) * kGroupDataFrames, chunks.length),
+        math.min((group + 1) * kGroupDataFrames, dataChunks.length),
       );
       var groupFlags = baseFlags;
       if (group == totalGroups - 1) groupFlags |= kFlagLastGroup;
@@ -172,17 +232,6 @@ class Encoder {
         );
       }
     }
-
-    return EncodeResult(
-      frames: frames,
-      stats: EncodeStats(
-        originalSize: data.length,
-        compressedSize: stream.length,
-        frameCount: frames.length,
-        groupCount: totalGroups,
-        sha256Hex: sha.map((b) => b.toRadixString(16).padLeft(2, '0')).join(),
-      ),
-      barcode: barcode,
-    );
+    return frames;
   }
 }

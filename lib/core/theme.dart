@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 
 /// Middle Out theme — the V7 recoloured palette.
 ///
@@ -84,7 +85,7 @@ class AppTheme {
               : clay.withValues(alpha: 0.5),
         ),
       ),
-      textTheme: const TextTheme(
+      textTheme: GoogleFonts.interTextTheme(const TextTheme(
         displaySmall: TextStyle(
           fontSize: 32,
           fontWeight: FontWeight.w800,
@@ -109,7 +110,7 @@ class AppTheme {
           fontWeight: FontWeight.w600,
           color: moss,
         ),
-      ),
+      )),
     );
   }
 
@@ -151,7 +152,7 @@ class AppTheme {
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
         ),
       ),
-      textTheme: const TextTheme(
+      textTheme: GoogleFonts.interTextTheme(const TextTheme(
         displaySmall: TextStyle(
           fontSize: 32,
           fontWeight: FontWeight.w800,
@@ -176,7 +177,7 @@ class AppTheme {
           fontWeight: FontWeight.w600,
           color: cream,
         ),
-      ),
+      )),
     );
   }
 }

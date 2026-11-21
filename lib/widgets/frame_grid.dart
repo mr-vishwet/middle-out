@@ -3,14 +3,18 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 
 import '../codec/code_grid.dart';
+import 'app_logo.dart';
 
-/// Paints a Middle Out Code grid (or barcode rows) with the logo tile in
-/// the centre — the same visual the encoded PDF carries.
+/// Paints a Middle Out Code grid (or barcode rows) with the app-icon tile
+/// in the centre — the same visual the encoded PDF carries.
 ///
 /// The centre tile is reserved white space in the grid itself; this widget
-/// draws the Middle Out mark over it (a lime rounded square with the
-/// "M" cut — the Play Store app-icon tile in the real app).
+/// overlays the Play Store app-icon tile SVG on it (per the V7 spec: the
+/// QR centre carries the app icon, and the barcode carries it in a white
+/// centre block). Codes stay flat black-and-white on white — the codes
+/// are functional, never recolored.
 class FrameCodeView extends StatelessWidget {
+  /// Creates a code view for a grid, or for [barcodeRows] when set.
   const FrameCodeView({
     required this.grid,
     this.barcodeRows,
@@ -28,26 +32,101 @@ class FrameCodeView extends StatelessWidget {
     final isBarcode = barcodeRows != null;
     return AspectRatio(
       aspectRatio: isBarcode ? 2.2 : 1,
-      child: CustomPaint(
-        painter: _CodePainter(
-          grid: grid,
-          barcodeRows: barcodeRows,
-          foreground: Theme.of(context).colorScheme.onSurface,
-        ),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final size = Size(constraints.maxWidth, constraints.maxHeight);
+          return Stack(
+            children: [
+              CustomPaint(
+                size: size,
+                painter: _CodePainter(
+                  grid: grid,
+                  barcodeRows: barcodeRows,
+                  foreground: Theme.of(context).colorScheme.onSurface,
+                ),
+              ),
+              if (!isBarcode && grid != null)
+                _GridCentreTile(grid: grid!, size: size),
+              if (isBarcode)
+                const Center(
+                  child: _BarcodeCentreTile(),
+                ),
+            ],
+          );
+        },
       ),
     );
   }
 }
 
+/// The app-icon tile over the grid's reserved centre.
+class _GridCentreTile extends StatelessWidget {
+  /// Creates a centre tile positioned over the grid's reserved cells.
+  const _GridCentreTile({required this.grid, required this.size});
+
+  /// The module matrix.
+  final List<Uint8List> grid;
+
+  /// The painted size.
+  final Size size;
+
+  @override
+  Widget build(BuildContext context) {
+    final n = grid.length;
+    final quiet = CodeGrid.quietModules;
+    final total = n + 2 * quiet;
+    final (r0, c0, side) = CodeGrid.centreTile(n);
+    final left = (c0 + quiet) / total * size.width;
+    final top = (r0 + quiet) / total * size.height;
+    final tileSize = side / total * size.width;
+    return Positioned(
+      left: left,
+      top: top,
+      width: tileSize,
+      height: tileSize,
+      child: const AppLogo(variant: LogoVariant.appIcon),
+    );
+  }
+}
+
+/// The app-icon tile in a white centre block over the barcode.
+class _BarcodeCentreTile extends StatelessWidget {
+  /// Creates the barcode centre tile.
+  const _BarcodeCentreTile();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(6),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: const SizedBox(
+        width: 44,
+        height: 44,
+        child: AppLogo(variant: LogoVariant.appIcon),
+      ),
+    );
+  }
+}
+
+/// Paints the modules (grid) or bars (barcode) of a code.
 class _CodePainter extends CustomPainter {
+  /// Creates a code painter.
   _CodePainter({
     required this.grid,
     required this.barcodeRows,
     required this.foreground,
   });
 
+  /// 2D module matrix (1 = black).
   final List<Uint8List>? grid;
+
+  /// Stacked barcode rows.
   final List<Uint8List>? barcodeRows;
+
+  /// Module/bar colour.
   final Color foreground;
 
   @override
@@ -81,37 +160,6 @@ class _CodePainter extends CustomPainter {
         }
       }
     }
-    // Centre logo tile.
-    final (r0, c0, side) = CodeGrid.centreTile(n);
-    final tileRect = Rect.fromLTWH(
-      (c0 + quiet) * module,
-      (r0 + quiet) * module,
-      side * module,
-      side * module,
-    );
-    final tilePaint = Paint()..color = const Color(0xFFBEF264);
-    canvas.drawRRect(
-      RRect.fromRectAndRadius(tileRect, Radius.circular(module * 2)),
-      tilePaint,
-    );
-    final textPainter = TextPainter(
-      text: TextSpan(
-        text: 'M',
-        style: TextStyle(
-          color: const Color(0xFF14200A),
-          fontSize: side * module * 0.6,
-          fontWeight: FontWeight.w900,
-        ),
-      ),
-      textDirection: TextDirection.ltr,
-    )..layout();
-    textPainter.paint(
-      canvas,
-      Offset(
-        tileRect.center.dx - textPainter.width / 2,
-        tileRect.center.dy - textPainter.height / 2,
-      ),
-    );
   }
 
   void _paintBarcode(Canvas canvas, Size size, Paint paint) {
