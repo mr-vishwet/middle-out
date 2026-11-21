@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../core/adaptive.dart';
 import '../core/format.dart';
@@ -984,7 +984,6 @@ class ConnectedScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final state = AppScope.of(context);
     final auth = state.auth;
     return AdaptiveScaffold(
@@ -1101,7 +1100,6 @@ class DataControlsScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final state = AppScope.of(context);
     return AdaptiveScaffold(
       title: 'Data controls',

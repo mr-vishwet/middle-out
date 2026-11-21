@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 
 import '../core/adaptive.dart';
@@ -123,7 +123,7 @@ class ShareScreen extends StatelessWidget {
                                 if (context.mounted) {
                                   ScaffoldMessenger.of(context).showSnackBar(
                                     SnackBar(
-                                      content: Text(
+                                      content: const Text(
                                         'Demo link created — expires in 7 days',
                                       ),
                                       action: SnackBarAction(
@@ -219,7 +219,6 @@ class _LinkRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final status = link.revoked
         ? 'Revoked'
         : link.expired

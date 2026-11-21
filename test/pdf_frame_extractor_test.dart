@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:middle_out/codec/code_grid.dart';
 import 'package:middle_out/codec/encoder.dart';
@@ -32,7 +33,7 @@ Uint8List fixturePdf(List<Uint8List> pixels, int width, int height) {
     }
     if (bits > 0) raw[offset] = current << (8 - bits);
   }
-  final compressed = ZLibEncoder().encode(raw);
+  final compressed = const ZLibEncoder().encode(raw);
   final header = ascii.encode(
     '%PDF-1.4\n1 0 obj\n<< /Type /XObject /Subtype /Image /Width $width '
     '/Height $height /BitsPerComponent 1 /ColorSpace /DeviceGray '
@@ -50,7 +51,7 @@ Uint8List fixturePdf(List<Uint8List> pixels, int width, int height) {
 List<Uint8List> gridPixels(Uint8List frameBytes) {
   final grid = CodeGrid.buildGrid(frameBytes);
   final n = grid.length;
-  final quiet = CodeGrid.quietModules;
+  const quiet = CodeGrid.quietModules;
   final size = n + 2 * quiet;
   final rows = List<Uint8List>.generate(size, (_) => Uint8List(size));
   for (var r = 0; r < n; r++) {
@@ -65,7 +66,7 @@ List<Uint8List> barcodePixels(Uint8List frameBytes) {
   const barPx = 2;
   const rowPx = 24;
   const gapPx = 4;
-  final width = CodeGrid.barcodeRowBars * barPx;
+  const width = CodeGrid.barcodeRowBars * barPx;
   final height = rows.length * (rowPx + gapPx);
   final pixels = List<Uint8List>.generate(height, (_) => Uint8List(width));
   for (var ri = 0; ri < rows.length; ri++) {

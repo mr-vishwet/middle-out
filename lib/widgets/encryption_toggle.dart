@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// Encryption toggle + passphrase field. Default ON.
 ///
@@ -6,6 +6,8 @@ import 'package:flutter/material.dart';
 /// The passphrase never leaves the device — it derives the ChaCha20 key
 /// locally (PBKDF2) and is never stored.
 class EncryptionToggle extends StatelessWidget {
+  /// Creates an encryption toggle with the current [encrypted] state and
+  /// [passphrase], reporting changes via the callbacks.
   const EncryptionToggle({
     required this.encrypted,
     required this.passphrase,
@@ -14,9 +16,16 @@ class EncryptionToggle extends StatelessWidget {
     super.key,
   });
 
+  /// Whether the payload is encrypted (default ON).
   final bool encrypted;
+
+  /// The current passphrase text (never stored).
   final String passphrase;
+
+  /// Called when the encryption switch flips.
   final ValueChanged<bool> onEncryptedChanged;
+
+  /// Called when the passphrase text changes.
   final ValueChanged<String> onPassphraseChanged;
 
   @override

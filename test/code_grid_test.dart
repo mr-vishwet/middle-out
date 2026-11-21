@@ -71,15 +71,15 @@ void main() {
         [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
       );
       // IHDR: width 8, height 8, bit depth 1, colour type 0.
-      final ihdr = ByteData.sublistView(png, 16, 13);
+      final ihdr = ByteData.sublistView(png, 16, 29);
       expect(ihdr.getUint32(0), 8);
       expect(ihdr.getUint32(4), 8);
       expect(ihdr.getUint8(8), 1);
       expect(ihdr.getUint8(9), 0);
       // IDAT decompresses to 8 scanlines of filter 0 + 1 data byte.
-      final idatLength = ByteData.sublistView(png, 33, 4).getUint32(0);
+      final idatLength = ByteData.sublistView(png, 33, 37).getUint32(0);
       final idat = png.sublist(41, 41 + idatLength);
-      final raw = ZLibDecoder().decodeBytes(idat);
+      final raw = const ZLibDecoder().decodeBytes(idat);
       expect(raw.length, 8 * 2);
       for (var r = 0; r < 8; r++) {
         expect(raw[r * 2], 0, reason: 'filter byte must be 0');

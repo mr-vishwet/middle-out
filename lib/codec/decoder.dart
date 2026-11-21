@@ -25,6 +25,11 @@ class Decoder {
     return compressedSize - maxPayload * (totalDataFrames - 1);
   }
 
+  /// Rebuilds the original file bytes from raw frame blobs.
+  ///
+  /// Frames that fail their payload CRC are rebuilt from parity. Throws
+  /// [UnrecoverableException] when too many frames are lost and
+  /// [VerificationException] when the rebuilt bytes fail verification.
   static Uint8List decode(
     List<Uint8List> frameBlobs, {
     String? passphrase,
@@ -146,9 +151,9 @@ class Decoder {
         }
         final key = deriveKey(passphrase, meta.salt);
         final plain = ChaCha20.xor(key, meta.nonce, stream.toBytes());
-        data = Uint8List.fromList(ZLibDecoder().decodeBytes(plain));
+        data = Uint8List.fromList(const ZLibDecoder().decodeBytes(plain));
       } else {
-        data = Uint8List.fromList(ZLibDecoder().decodeBytes(stream.toBytes()));
+        data = Uint8List.fromList(const ZLibDecoder().decodeBytes(stream.toBytes()));
       }
     } on VerificationException {
       rethrow;

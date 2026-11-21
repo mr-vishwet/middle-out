@@ -80,7 +80,7 @@ class Encoder {
   }) {
     final sha = Uint8List.fromList(sha256.convert(data).bytes);
     final compressed =
-        Uint8List.fromList(ZLibEncoder().encode(data, level: 9));
+        Uint8List.fromList(const ZLibEncoder().encode(data, level: 9));
 
     final encrypted = passphrase != null;
     final Uint8List salt;
@@ -105,7 +105,7 @@ class Encoder {
     final chunks = <Uint8List>[];
     for (var i = 0; i < stream.length; i += maxPayload) {
       final end = math.min(i + maxPayload, stream.length);
-      chunks.add(Uint8List.sublistView(stream, i, end - i));
+      chunks.add(Uint8List.sublistView(stream, i, end));
     }
     if (chunks.isEmpty) chunks.add(Uint8List(0));
 

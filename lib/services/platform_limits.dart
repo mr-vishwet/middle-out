@@ -16,6 +16,7 @@ enum EncodeMode {
   webCloud,
 }
 
+/// Human-readable info for an [EncodeMode]: limits, labels, descriptions.
 extension EncodeModeInfo on EncodeMode {
   /// Maximum single-file size for this mode, in bytes.
   int get maxBytes => switch (this) {
@@ -24,12 +25,14 @@ extension EncodeModeInfo on EncodeMode {
         EncodeMode.webCloud => PlatformLimits.webCloudMaxBytes,
       };
 
+  /// Short label for the mode picker (e.g. 'Web · Local').
   String get label => switch (this) {
         EncodeMode.native => 'Native app',
         EncodeMode.webLocal => 'Web · Local',
         EncodeMode.webCloud => 'Web · Cloud',
       };
 
+  /// One-line description of where the encode runs.
   String get description => switch (this) {
         EncodeMode.native => 'Streaming, local — nothing leaves your device.',
         EncodeMode.webLocal => 'In-browser, no upload — nothing leaves this tab.',

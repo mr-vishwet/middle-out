@@ -48,7 +48,7 @@ class StreamingEncoder {
     final tempFile = File('${tempDir.path}/stream.bin');
     try {
       // --- Pass 1: hash + compress + encrypt to a temp file. ---
-      final hashSink = AccumulatorSink<Digest>();
+      final hashSink = _AccumulatorSink<Digest>();
       final hashConverter = sha256.startChunkedConversion(hashSink);
       final encrypted = passphrase != null;
       final Uint8List salt;
@@ -157,6 +157,21 @@ class StreamingEncoder {
       }
     }
   }
+}
+
+/// Collects chunked-conversion events into [events].
+///
+/// `dart:convert` no longer ships `AccumulatorSink`, so this file keeps
+/// its own tiny equivalent for the streaming SHA-256 pass.
+class _AccumulatorSink<T> implements Sink<T> {
+  /// All events received so far.
+  final events = <T>[];
+
+  @override
+  void add(T event) => events.add(event);
+
+  @override
+  void close() {}
 }
 
 /// Collects zlib output chunks and forwards them to [onChunk].

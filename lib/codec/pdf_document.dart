@@ -10,8 +10,13 @@ import 'png_encode.dart';
 
 /// Statistics for an assembled encoded PDF.
 class PdfStats {
+  /// Creates PDF statistics: [pages] pages totalling [sizeBytes] bytes.
   const PdfStats({required this.pages, required this.sizeBytes});
+
+  /// Number of pages in the encoded PDF (cover + one per frame).
   final int pages;
+
+  /// Total size of the encoded PDF in bytes.
   final int sizeBytes;
 }
 
@@ -24,7 +29,11 @@ class PdfStats {
 class PdfDocument {
   /// Barcode rendering geometry inside the PDF image (pixels per bar/row).
   static const int barcodeBarPx = 2;
+
+  /// Height of one barcode row in the PDF image, in pixels.
   static const int barcodeRowPx = 24;
+
+  /// Vertical gap between barcode rows in the PDF image, in pixels.
   static const int barcodeGapPx = 4;
 
   /// Builds the PDF bytes for [result] (the encode of [fileName]).
@@ -50,7 +59,7 @@ class PdfDocument {
             pw.SizedBox(height: 48),
             pw.Text(
               'MIDDLE OUT',
-              style: pw.TextStyle(
+              style: const pw.TextStyle(
                 fontSize: 34,
                 fontWeight: pw.FontWeight.bold,
               ),
@@ -154,7 +163,7 @@ class PdfDocument {
   /// Grid matrix -> PNG bytes, with a quiet zone of white modules.
   static Uint8List _gridPng(List<Uint8List> grid) {
     final n = grid.length;
-    final quiet = CodeGrid.quietModules;
+    const quiet = CodeGrid.quietModules;
     final size = n + 2 * quiet;
     final rows = List<Uint8List>.generate(size, (_) => Uint8List(size));
     for (var r = 0; r < n; r++) {
@@ -165,7 +174,7 @@ class PdfDocument {
 
   /// Barcode rows -> PNG bytes (bars widened, rows stacked with gaps).
   static Uint8List _barcodePng(List<Uint8List> rows) {
-    final width = CodeGrid.barcodeRowBars * barcodeBarPx;
+    const width = CodeGrid.barcodeRowBars * barcodeBarPx;
     final height = rows.length * (barcodeRowPx + barcodeGapPx);
     final pixels = List<Uint8List>.generate(height, (_) => Uint8List(width));
     for (var ri = 0; ri < rows.length; ri++) {

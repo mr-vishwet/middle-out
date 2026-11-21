@@ -55,9 +55,7 @@ class PdfFrameExtractor {
         final matrix = invert ? _invert(pixels) : pixels;
         final blob = _tryParseCode(matrix);
         if (blob == null) continue;
-        final key = blob.length.toString() +
-            '-' +
-            blob.sublist(0, 16).join(',');
+        final key = '${blob.length}-${blob.sublist(0, 16).join(',')}';
         if (seen.add(key)) frames.add(blob);
         break;
       }
@@ -102,7 +100,7 @@ class PdfFrameExtractor {
       final Uint8List streamBytes;
       if (length != null && dataStart + length <= pdf.length) {
         streamBytes =
-            Uint8List.sublistView(pdf, dataStart, length);
+            Uint8List.sublistView(pdf, dataStart, dataStart + length);
       } else {
         final endAt = _indexOf(pdf, _endstreamMarker, dataStart);
         if (endAt < 0) continue;
@@ -111,7 +109,7 @@ class PdfFrameExtractor {
             (pdf[end - 1] == 0x0A || pdf[end - 1] == 0x0D)) {
           end--;
         }
-        streamBytes = Uint8List.sublistView(pdf, dataStart, end - dataStart);
+        streamBytes = Uint8List.sublistView(pdf, dataStart, end);
       }
       final width = _dictInt(dictText, '/Width');
       final height = _dictInt(dictText, '/Height');
@@ -169,7 +167,7 @@ class PdfFrameExtractor {
     if (!image.flate) return null;
     late Uint8List raw;
     try {
-      raw = Uint8List.fromList(ZLibDecoder().decodeBytes(image.stream));
+      raw = Uint8List.fromList(const ZLibDecoder().decodeBytes(image.stream));
     } catch (_) {
       return null;
     }
@@ -219,7 +217,7 @@ class PdfFrameExtractor {
       if (raw.length < rowBytes * image.height) return null;
       return List<Uint8List>.generate(
         image.height,
-        (y) => Uint8List.sublistView(raw, y * rowBytes, rowBytes),
+        (y) => Uint8List.sublistView(raw, y * rowBytes, (y + 1) * rowBytes),
       );
     }
     if (predictor == 2) {
@@ -303,7 +301,7 @@ class PdfFrameExtractor {
         if (n < CodeGrid.minSize) continue;
         final grid = List<Uint8List>.generate(
           n,
-          (r) => Uint8List.sublistView(matrix[r + quiet], quiet, n),
+          (r) => Uint8List.sublistView(matrix[r + quiet], quiet, quiet + n),
         );
         final blob = _parseGridBlob(grid);
         if (blob != null) return blob;
@@ -313,7 +311,7 @@ class PdfFrameExtractor {
     // rows stacked at 24 px + 4 px gap (see PdfDocument).
     for (final barPx in [PdfBarcodeGeometry.barPx, 1]) {
       if (width % (CodeGrid.barcodeRowBars * barPx) != 0) continue;
-      final rowStride = PdfBarcodeGeometry.rowPx + PdfBarcodeGeometry.gapPx;
+      const rowStride = PdfBarcodeGeometry.rowPx + PdfBarcodeGeometry.gapPx;
       if (height % rowStride != 0) continue;
       final rowCount = height ~/ rowStride;
       final rows = <Uint8List>[];

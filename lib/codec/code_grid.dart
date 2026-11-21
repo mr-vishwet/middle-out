@@ -15,10 +15,16 @@ import 'frame.dart';
 ///
 /// Matrices are `List<Uint8List>` rows of 0 (white) / 1 (black) modules.
 class CodeGrid {
+  /// Smallest grid side in modules; grids grow from here.
   static const int minSize = 32;
+
+  /// Grid side grows in steps of this many modules.
   static const int step = 4;
+
+  /// Quiet-zone width around the grid, in modules.
   static const int quietModules = 4;
 
+  /// Payload bytes carried by one barcode row.
   static const int barcodeRowBytes = 64;
 
   // --- Grid geometry -------------------------------------------------------
@@ -65,8 +71,11 @@ class CodeGrid {
   static Set<(int, int)> _reservedCells(int n) =>
       _finderCells(n).union(_timingCells(n)).union(_centreCells(n));
 
+  /// Placeable (non-reserved) cells of an `n` x `n` grid, in bits.
   static int gridCapacityBits(int n) => n * n - _reservedCells(n).length;
 
+  /// Smallest grid side whose capacity fits a payload of
+  /// [payloadLength] bytes (plus the 4-byte length prefix).
   static int chooseGridSize(int payloadLength) {
     final needBits = (payloadLength + 4) * 8;
     var n = minSize;
@@ -159,6 +168,7 @@ class CodeGrid {
   /// [512 data][4 stop guard] = 528 bars per row.
   static const int barcodeRowBars = 4 + 8 + barcodeRowBytes * 8 + 4;
 
+  /// Renders [payload] into stacked barcode rows of [barcodeRowBars] bars.
   static List<Uint8List> buildBarcodeRows(Uint8List payload) {
     final blob = BytesBuilder()
       ..add(

@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../core/format.dart';
 import '../services/platform_limits.dart';
@@ -6,6 +6,7 @@ import '../services/platform_limits.dart';
 /// Shows the current mode's per-file limit and, when a picked file exceeds
 /// it, the routing advice (which mode can hold the file).
 class LimitBanner extends StatelessWidget {
+  /// Creates a limit banner for [mode], optionally checking [fileSize].
   const LimitBanner({
     required this.mode,
     required this.onModeChanged,
@@ -13,8 +14,13 @@ class LimitBanner extends StatelessWidget {
     super.key,
   });
 
+  /// The current encode mode.
   final EncodeMode mode;
+
+  /// Called when the user picks a different mode.
   final ValueChanged<EncodeMode> onModeChanged;
+
+  /// Size of the picked file in bytes, if one is picked.
   final int? fileSize;
 
   @override

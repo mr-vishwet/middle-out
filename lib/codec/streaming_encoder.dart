@@ -4,5 +4,6 @@
 /// The real implementation lives in `streaming_encoder_io.dart` (native
 /// platforms, via dart:io); the stub throws on web, where files have no
 /// paths and the in-memory path is used instead.
+library;
 export 'streaming_encoder_stub.dart'
     if (dart.library.io) 'streaming_encoder_io.dart';

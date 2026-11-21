@@ -4,7 +4,10 @@ import '../core/constants.dart';
 
 /// Errors thrown by the Middle Out codec.
 class CodecException implements Exception {
+  /// Creates an exception with a human-readable [message].
   const CodecException(this.message);
+
+  /// Human-readable description of what went wrong.
   final String message;
   @override
   String toString() => 'CodecException: $message';
@@ -12,17 +15,20 @@ class CodecException implements Exception {
 
 /// A frame failed its header or payload CRC.
 class CorruptFrameException extends CodecException {
+  /// Creates a corrupt-frame exception with [message].
   const CorruptFrameException(super.message);
 }
 
 /// Too many frames lost in one parity trio to rebuild the file.
 class UnrecoverableException extends CodecException {
+  /// Creates an unrecoverable exception with [message].
   const UnrecoverableException(super.message);
 }
 
 /// Reassembled bytes failed the SHA-256 / size check (wrong passphrase,
 /// tampered payload, or a decompression failure).
 class VerificationException extends CodecException {
+  /// Creates a verification exception with [message].
   const VerificationException(super.message);
 }
 
@@ -58,6 +64,7 @@ class Crc32 {
 /// Wire format is defined in `lib/core/constants.dart` and mirrored
 /// byte-for-byte by `reference/codec_reference.py`.
 class Frame {
+  /// Creates a frame from its header fields and [payload].
   const Frame({
     required this.frameIndex,
     required this.kind,
@@ -75,28 +82,62 @@ class Frame {
     this.payloadCorrupt = false,
   });
 
+  /// Global sequence number of this frame in the encoded file.
   final int frameIndex;
+
+  /// Frame kind: data ([kFrameKindData]) or parity ([kFrameKindParity]).
   final int kind;
+
+  /// Index of the parity group this frame belongs to.
   final int groupIndex;
+
+  /// Slot within the group (0..2 for data, 3 for parity).
   final int slot;
+
+  /// Bit flags ([kFlagEncrypted], [kFlagBarcode], [kFlagLastGroup]).
   final int flags;
+
+  /// Total number of parity groups in the encoded file.
   final int totalGroups;
+
+  /// Total number of data frames across all groups.
   final int totalDataFrames;
+
+  /// Size of the original file in bytes.
   final int originalSize;
+
+  /// Size of the compressed stream in bytes.
   final int compressedSize;
+
+  /// SHA-256 of the original file (32 bytes).
   final Uint8List originalSha256;
+
+  /// PBKDF2 salt for the passphrase key (16 bytes, zeroed when plain).
   final Uint8List salt;
+
+  /// ChaCha20 nonce for the payload encryption (12 bytes).
   final Uint8List nonce;
+
+  /// Frame payload bytes (compressed stream chunk or parity data).
   final Uint8List payload;
 
   /// True when the payload CRC failed. The header is still trustworthy, so
   /// the decoder treats the frame as lost and rebuilds it from parity.
   final bool payloadCorrupt;
 
+  /// True when [kind] is a data frame.
   bool get isData => kind == kFrameKindData;
+
+  /// True when [kind] is a parity frame.
   bool get isParity => kind == kFrameKindParity;
+
+  /// True when the payload is encrypted ([kFlagEncrypted]).
   bool get isEncrypted => flags & kFlagEncrypted != 0;
+
+  /// True when the frame is rendered as a barcode ([kFlagBarcode]).
   bool get isBarcode => flags & kFlagBarcode != 0;
+
+  /// True when this frame is in the last group ([kFlagLastGroup]).
   bool get isLastGroup => flags & kFlagLastGroup != 0;
 
   /// Serialises the frame: header + payload + payload CRC.
@@ -167,7 +208,11 @@ class Frame {
         'frame length ${raw.length} != header + $payloadLength + CRC',
       );
     }
-    final payload = Uint8List.sublistView(raw, kHeaderSize, payloadLength);
+    final payload = Uint8List.sublistView(
+      raw,
+      kHeaderSize,
+      kHeaderSize + payloadLength,
+    );
     final payloadCrc =
         ByteData.sublistView(raw, kHeaderSize + payloadLength).getUint32(0);
     final corrupt = Crc32.checksum(payload) != payloadCrc;
@@ -181,9 +226,9 @@ class Frame {
       totalDataFrames: header.getUint16(11),
       originalSize: header.getUint64(17),
       compressedSize: header.getUint64(25),
-      originalSha256: Uint8List.sublistView(raw, 33, 32),
-      salt: Uint8List.sublistView(raw, 65, 16),
-      nonce: Uint8List.sublistView(raw, 81, 12),
+      originalSha256: Uint8List.sublistView(raw, 33, 65),
+      salt: Uint8List.sublistView(raw, 65, 81),
+      nonce: Uint8List.sublistView(raw, 81, 93),
       payload: Uint8List.fromList(payload),
       payloadCorrupt: corrupt,
     );

@@ -13,6 +13,7 @@
 /// * [authUpgrade] takes an optional `int` file size in bytes.
 library;
 
+/// Route-name constants for every screen in the app.
 abstract final class AppRoutes {
   /// m01/w01 — home dashboard (also the shell's Home tab).
   static const String home = '/';

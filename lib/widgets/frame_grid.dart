@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../codec/code_grid.dart';
 import 'app_logo.dart';
@@ -73,7 +73,7 @@ class _GridCentreTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final n = grid.length;
-    final quiet = CodeGrid.quietModules;
+    const quiet = CodeGrid.quietModules;
     final total = n + 2 * quiet;
     final (r0, c0, side) = CodeGrid.centreTile(n);
     final left = (c0 + quiet) / total * size.width;
@@ -142,7 +142,7 @@ class _CodePainter extends CustomPainter {
   void _paintGrid(Canvas canvas, Size size, Paint paint) {
     final matrix = grid!;
     final n = matrix.length;
-    final quiet = CodeGrid.quietModules;
+    const quiet = CodeGrid.quietModules;
     final total = n + 2 * quiet;
     final module = size.width / total;
     for (var r = 0; r < n; r++) {

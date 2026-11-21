@@ -1,4 +1,3 @@
-import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
@@ -231,7 +230,7 @@ class EncodeController extends ChangeNotifier {
         current,
         estimateSampleBytes,
       );
-      final compressed = ZLibEncoder().encode(sample, level: 9);
+      final compressed = const ZLibEncoder().encode(sample, level: 9);
       final sampleRatio = compressed.isEmpty
           ? 1.0
           : sample.length / compressed.length;

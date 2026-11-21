@@ -42,12 +42,16 @@ const int kFrameVersion = 1;
 /// Frame total size = [kHeaderSize] + payloadLength + 4.
 const int kHeaderSize = 97;
 
-/// Frame kinds.
+/// Frame kind: a data frame carrying compressed-stream bytes.
 const int kFrameKindData = 0;
+
+/// Frame kind: a parity frame carrying XOR recovery bytes.
 const int kFrameKindParity = 1;
 
-/// Flags.
+/// Flag: the payload is ChaCha20-encrypted.
 const int kFlagEncrypted = 0x01;
+
+/// Flag: this frame is in the last parity group.
 const int kFlagLastGroup = 0x02;
 
 /// Set when the frames were rendered as stacked-row barcodes rather than
@@ -58,14 +62,24 @@ const int kFlagBarcode = 0x04;
 /// Frames per group: 6 DATA + 2 PARITY. Every group is exactly 8 frames so
 /// the encoded PDF layout is uniform (1 cover + 8 pages per group).
 const int kGroupDataFrames = 6;
+
+/// Parity frames per group (slots 6 and 7).
 const int kGroupParityFrames = 2;
+
+/// Total frames per group (data + parity).
 const int kGroupSize = kGroupDataFrames + kGroupParityFrames;
 
 /// Parity slot 6 protects data slots 0, 1, 2; parity slot 7 protects
 /// slots 3, 4, 5. Each trio can lose any ONE frame and still recover.
 const List<int> kParityATrio = [0, 1, 2];
+
+/// Data slots protected by parity slot 7.
 const List<int> kParityBTrio = [3, 4, 5];
+
+/// Group slot of the parity frame protecting [kParityATrio].
 const int kParityASlot = 6;
+
+/// Group slot of the parity frame protecting [kParityBTrio].
 const int kParityBSlot = 7;
 
 /// Default maximum payload per frame (64 KiB). Sized for reliable scanning
@@ -112,6 +126,8 @@ class PlatformLimits {
 /// when a pathological input (already-compressed or random data) would
 /// exceed it.
 const int kPdfSizeMinPerGb = 5 * 1024 * 1024;
+
+/// Maximum encoded-PDF size per GB of input (20 MB).
 const int kPdfSizeMaxPerGb = 20 * 1024 * 1024;
 
 /// ---------------------------------------------------------------------------
@@ -124,12 +140,25 @@ const int kPdfSizeMaxPerGb = 20 * 1024 * 1024;
 /// ---------------------------------------------------------------------------
 
 class DemoFixture {
+  /// Demo file name shown in the seeded demo.
   static const String fileName = 'Podcast — Ep. 14 Master.wav';
+
+  /// Demo original size in bytes (1.04 GB).
   static const int originalBytes = 1040000000; // 1.04 GB
+
+  /// Demo encoded-PDF size in bytes (14.2 MB).
   static const int encodedBytes = 14200000; // 14.2 MB
+
+  /// Demo compression ratio label.
   static const String ratioLabel = '73×';
+
+  /// Demo SHA-256 prefix shown on the cover (not a real hash).
   static const String sha256Prefix = '9f2c41be 7d03a81d 5c19e2f4 08b6d3a7';
+
+  /// Demo data frame count.
   static const int dataFrames = 6;
+
+  /// Demo parity frame count.
   static const int parityFrames = 2;
 
   /// Demo frame sizes in MB (6 DATA frames summing to 1,040 MB).

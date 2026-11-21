@@ -43,7 +43,8 @@ void main() {
         EncodeMode.webLocal,
       );
       expect(advice, contains('Web · Cloud'));
-      expect(advice, contains('50 GB'));
+      // 50 GiB in the app's decimal formatting (50 * 1024^3 bytes).
+      expect(advice, contains('53.7 GB'));
     });
 
     test('over 100 GB has no route', () {
