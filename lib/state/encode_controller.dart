@@ -231,7 +231,7 @@ class EncodeController extends ChangeNotifier {
         current,
         estimateSampleBytes,
       );
-      final compressed = ZLibEncoder(level: 9).encode(sample);
+      final compressed = ZLibEncoder().encode(sample, level: 9);
       final sampleRatio = compressed.isEmpty
           ? 1.0
           : sample.length / compressed.length;

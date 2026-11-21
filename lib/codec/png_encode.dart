@@ -62,7 +62,7 @@ class PngEncode {
       }
     }
 
-    final compressed = ZLibEncoder(level: 9).encode(raw);
+    final compressed = ZLibEncoder().encode(raw, level: 9);
     final out = BytesBuilder()
       ..add(_pngSignature)
       ..add(_chunk('IHDR', _ihdr(width, height)))

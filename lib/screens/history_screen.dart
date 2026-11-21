@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart';
+import 'package:flutter/foundation.dart' hide shortHash;
 import 'package:flutter/material.dart';
 
 import '../core/adaptive.dart';

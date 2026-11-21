@@ -80,7 +80,7 @@ class Encoder {
   }) {
     final sha = Uint8List.fromList(sha256.convert(data).bytes);
     final compressed =
-        Uint8List.fromList(ZLibEncoder(level: 9).encode(data));
+        Uint8List.fromList(ZLibEncoder().encode(data, level: 9));
 
     final encrypted = passphrase != null;
     final Uint8List salt;
