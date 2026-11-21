@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 
 import '../core/adaptive.dart';
-import '../core/routes.dart';
 import '../state/app_scope.dart';
 import 'auth_flow.dart';
 import 'decode_screen.dart';
@@ -15,7 +14,7 @@ import 'home_screen.dart';
 /// Tabs: Home (m01/w01), Encode (m02/w02 picker), Decode (m13/w13
 /// entry), History (m11/w11), Account (m21/w21 welcome when guest,
 /// m28/w28 account home when signed in). Deeper screens push on top of
-/// the shell via the named routes in [AppRoutes].
+/// the shell via the named routes in `AppRoutes`.
 class ShellScreen extends StatefulWidget {
   /// Creates the app shell.
   const ShellScreen({super.key});

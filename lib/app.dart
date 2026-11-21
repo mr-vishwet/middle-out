@@ -10,7 +10,6 @@ import 'screens/decode_screen.dart';
 import 'screens/encode_screen.dart';
 import 'screens/frames_screen.dart';
 import 'screens/history_screen.dart';
-import 'screens/home_screen.dart';
 import 'screens/payoff_screen.dart';
 import 'screens/pdf_preview_screen.dart';
 import 'screens/result_screen.dart';

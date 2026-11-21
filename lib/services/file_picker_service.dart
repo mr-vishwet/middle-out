@@ -73,7 +73,10 @@ class FilePickerService {
         PlatformLimitsService.overLimitAdvice(file.size, mode),
       );
     }
-    return PickedRef(name: file.name, size: file.size, path: file.path, bytes: file.bytes);
+    // On web `PlatformFile.path` THROWS when read (no file paths in the
+    // browser) — pass null there; the bytes are already loaded via
+    // `withData: kIsWeb` above.
+    return PickedRef(name: file.name, size: file.size, path: kIsWeb ? null : file.path, bytes: file.bytes);
   }
 
   /// Opens the system picker for several files (batch queue).
@@ -102,7 +105,8 @@ class FilePickerService {
         PickedRef(
           name: file.name,
           size: file.size,
-          path: file.path,
+          // On web `PlatformFile.path` THROWS when read — see pickFileMeta.
+          path: kIsWeb ? null : file.path,
           bytes: file.bytes,
         ),
       );

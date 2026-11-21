@@ -1,5 +1,7 @@
-import 'dart:html' as html;
+import 'dart:js_interop';
 import 'dart:typed_data';
+
+import 'package:web/web.dart' as web;
 
 /// Downloads [bytes] via a browser anchor element. Returns the file name.
 Future<String> saveFileBytes(
@@ -7,12 +9,16 @@ Future<String> saveFileBytes(
   String fileName, {
   String mimeType = 'application/octet-stream',
 }) async {
-  final blob = html.Blob([bytes], mimeType);
-  final url = html.Url.createObjectUrlFromBlob(blob);
-  final anchor = html.AnchorElement(href: url)
+  final blob = web.Blob(
+    [bytes.toJS].toJS,
+    web.BlobPropertyBag(type: mimeType),
+  );
+  final url = web.URL.createObjectURL(blob);
+  final anchor = web.HTMLAnchorElement()
+    ..href = url
     ..download = fileName
     ..click();
-  html.Url.revokeObjectUrl(url);
+  web.URL.revokeObjectURL(url);
   anchor.remove();
   return fileName;
 }

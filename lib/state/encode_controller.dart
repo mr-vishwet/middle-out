@@ -502,7 +502,9 @@ class DecodeController extends ChangeNotifier {
       for (final file in result.files) {
         if (file.bytes != null) {
           picked.add(file.bytes!);
-        } else if (file.path != null) {
+        } else if (!kIsWeb && file.path != null) {
+          // On web `PlatformFile.path` THROWS when read — never touch it
+          // there (bytes are loaded via `withData: kIsWeb` above).
           picked.add(await readPickedFile(file.path!));
         }
       }

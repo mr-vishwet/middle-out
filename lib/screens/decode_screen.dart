@@ -181,8 +181,12 @@ class DecodeScreen extends StatelessWidget {
     );
     if (result == null || result.files.isEmpty) return;
     final file = result.files.single;
+    // On web `PlatformFile.path` THROWS when read — never touch it there
+    // (bytes are loaded via `withData: kIsWeb` above).
     final bytes = file.bytes ??
-        (file.path != null ? await readPickedFile(file.path!) : null);
+        (!kIsWeb && file.path != null
+            ? await readPickedFile(file.path!)
+            : null);
     if (bytes == null) return;
     await controller.importPdf(bytes, file.name);
     if (context.mounted && controller.phase == DecodePhase.ready) {

@@ -4,10 +4,8 @@ import 'dart:typed_data';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 
-import '../core/constants.dart';
 import 'code_grid.dart';
 import 'encoder.dart';
-import 'frame.dart';
 import 'png_encode.dart';
 
 /// Statistics for an assembled encoded PDF.

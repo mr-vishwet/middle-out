@@ -30,6 +30,9 @@ dependencies:
   # App logo assets (SVG) and UI type.
   flutter_svg: ^2.0.0
   google_fonts: ^6.2.0
+  # Browser APIs (Blob downloads) for the web file savers — the
+  # supported replacement for dart:html, deprecated since Dart 3.5.
+  web: ^1.0.0
 
 dev_dependencies:
   flutter_test:
