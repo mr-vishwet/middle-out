@@ -359,3 +359,5 @@ jobs:
       - run: flutter analyze
       - run: flutter test
 ```
+
+<!-- Deploy note: run #7 (dc4d5508) hit GitHub's transient artifact error ("Found 0 artifact(s)") on the deploy step; this commit re-triggers a fresh Pages deploy. -->
