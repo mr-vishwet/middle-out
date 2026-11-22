@@ -202,12 +202,8 @@ class _FirstFramePreview extends StatelessWidget {
   Widget build(BuildContext context) {
     final result = controller.result!;
     final raw = result.frames.first.toBytes();
-    if (result.barcode) {
-      return FrameCodeView(
-        grid: null,
-        barcodeRows: CodeGrid.buildBarcodeRows(raw),
-      );
-    }
-    return FrameCodeView(grid: CodeGrid.buildGrid(raw));
+    return FrameCodeView(
+      grid: CodeGrid.buildFrameGrid(raw, barcode: result.barcode),
+    );
   }
 }

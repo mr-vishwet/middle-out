@@ -73,7 +73,7 @@ class SettingsScreen extends StatelessWidget {
                       SwitchListTile.adaptive(
                         title: const Text('Barcode by default'),
                         subtitle: const Text(
-                          'Off: QR-style grid. On: stacked-row barcode.',
+                          'Off: QR-style grid. On: bar-grid barcode.',
                         ),
                         value: settings.defaultBarcode,
                         onChanged: settings.setDefaultBarcode,

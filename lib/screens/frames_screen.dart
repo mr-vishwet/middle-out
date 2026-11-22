@@ -135,12 +135,10 @@ class FrameDetailScreen extends StatelessWidget {
               children: [
                 TwoPane(
                   first: FrameCodeView(
-                    grid: result.barcode
-                        ? null
-                        : CodeGrid.buildGrid(raw),
-                    barcodeRows: result.barcode
-                        ? CodeGrid.buildBarcodeRows(raw)
-                        : null,
+                    grid: CodeGrid.buildFrameGrid(
+                      raw,
+                      barcode: result.barcode,
+                    ),
                   ),
                   second: Card(
                     child: Padding(

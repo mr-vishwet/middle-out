@@ -35,30 +35,47 @@ class PdfExtraction {
 /// The cover page's manifest grid parses to text, not a frame, and is
 /// skipped; only blobs with a valid frame header are kept.
 ///
-/// The reader is deliberately tolerant: it tries both pixel polarities,
-/// 1-bit and 8-bit greyscale (and RGB) images, and PNG/TIFF predictors,
-/// because the PDF writer's exact image encoding is an implementation
-/// detail. Anything it cannot parse is skipped, never guessed — a blob
-/// is only returned when it parses as a frame.
+/// Formats, identified by image aspect: new rectangular QR grids
+/// (w/h ~ 1.414) and bar-grids (w/h ~ 5.657), both full-bleed with no
+/// quiet zone; old square grids (w/h = 1, quiet zone 4) and old
+/// stacked-row barcodes (528 bars/row, 24 px bands + 4 px gaps).
+/// Dark pages are polarity-detected per image from the top-left finder
+/// (guard bars for stacked barcodes) and inverted before parsing, so
+/// light and dark PDFs decode identically.
+///
+/// The reader is deliberately tolerant: it handles 1-bit and 8-bit
+/// greyscale (and RGB) images, and PNG/TIFF predictors, because the PDF
+/// writer's exact image encoding is an implementation detail. Anything
+/// it cannot parse is skipped, never guessed — a blob is only returned
+/// when it parses as a frame.
 class PdfFrameExtractor {
   /// Extracts frame blobs from [pdfBytes].
   static PdfExtraction extract(Uint8List pdfBytes) {
     final images = _findImages(pdfBytes);
+    // New-format PDFs carry 1-bit code images plus one RGB logo tile;
+    // prefer the 1-bit images and never try to parse the logo. Old-format
+    // PDFs have only 8-bit RGB code images (no 1-bit image exists), so
+    // when no 1-bit image is present every image is attempted.
+    final hasOneBit = images.any(
+      (image) => image.bitsPerComponent == 1 && image.colors == 1,
+    );
+    final candidates = hasOneBit
+        ? [
+            for (final image in images)
+              if (image.bitsPerComponent == 1 && image.colors == 1) image,
+          ]
+        : images;
     final frames = <Uint8List>[];
     final seen = <String>{};
     var parsed = 0;
-    for (final image in images) {
+    for (final image in candidates) {
       final pixels = _decodeImage(image);
       if (pixels == null) continue;
       parsed++;
-      for (final invert in [false, true]) {
-        final matrix = invert ? _invert(pixels) : pixels;
-        final blob = _tryParseCode(matrix);
-        if (blob == null) continue;
-        final key = '${blob.length}-${blob.sublist(0, 16).join(',')}';
-        if (seen.add(key)) frames.add(blob);
-        break;
-      }
+      final blob = _tryParseCode(pixels);
+      if (blob == null) continue;
+      final key = '${blob.length}-${blob.sublist(0, 16).join(',')}';
+      if (seen.add(key)) frames.add(blob);
     }
     return PdfExtraction(
       frames: frames,
@@ -81,36 +98,57 @@ class PdfFrameExtractor {
     while (true) {
       final streamAt = _indexOf(pdf, _streamMarker, searchFrom);
       if (streamAt < 0) break;
+      // A "stream" match inside "endstream" is not a stream start: a
+      // real "stream" keyword follows its dict's ">>" + EOL, while
+      // "endstream" has 'd' (0x64) before it.
+      if (streamAt > 0 && pdf[streamAt - 1] == 0x64) {
+        searchFrom = streamAt + 1;
+        continue;
+      }
       // Stream data starts after "stream" + EOL (\r\n or \n).
       var dataStart = streamAt + _streamMarker.length;
       if (dataStart < pdf.length && pdf[dataStart] == 0x0D) dataStart++;
       if (dataStart < pdf.length && pdf[dataStart] == 0x0A) dataStart++;
       // The dictionary sits just before "stream" — look back for "<<".
       final dictStart = _lastIndexOf(pdf, [0x3C, 0x3C], streamAt);
-      searchFrom = dataStart;
-      if (dictStart < 0 || streamAt - dictStart > 4096) continue;
+      if (dictStart < 0 || streamAt - dictStart > 4096) {
+        // No dictionary: skip past the matching endstream, if any.
+        final endAt = _indexOf(pdf, _endstreamMarker, dataStart);
+        searchFrom = endAt < 0 ? pdf.length : endAt + _endstreamMarker.length;
+        continue;
+      }
       final dictText = latin1.decode(
         pdf.sublist(dictStart, streamAt),
         allowInvalid: true,
       );
-      if (!dictText.contains('/Subtype') || !dictText.contains('/Image')) {
-        continue;
-      }
+      // Extent of this stream's data. The next scan starts past it (and
+      // past its endstream), so a "stream" byte sequence inside
+      // compressed data never reads as a second stream — a phantom
+      // image. (The old code resumed inside the stream data, and every
+      // multi-image PDF picked up phantoms from "endstream" matches.)
       final length = _dictInt(dictText, '/Length');
-      final Uint8List streamBytes;
+      final int dataEnd;
       if (length != null && dataStart + length <= pdf.length) {
-        streamBytes =
-            Uint8List.sublistView(pdf, dataStart, dataStart + length);
+        dataEnd = dataStart + length;
       } else {
         final endAt = _indexOf(pdf, _endstreamMarker, dataStart);
-        if (endAt < 0) continue;
+        if (endAt < 0) {
+          searchFrom = pdf.length;
+          continue;
+        }
         var end = endAt;
         while (end > dataStart &&
             (pdf[end - 1] == 0x0A || pdf[end - 1] == 0x0D)) {
           end--;
         }
-        streamBytes = Uint8List.sublistView(pdf, dataStart, end);
+        dataEnd = end;
       }
+      final endAt = _indexOf(pdf, _endstreamMarker, dataEnd);
+      searchFrom = endAt < 0 ? dataEnd : endAt + _endstreamMarker.length;
+      if (!dictText.contains('/Subtype') || !dictText.contains('/Image')) {
+        continue;
+      }
+      final streamBytes = Uint8List.sublistView(pdf, dataStart, dataEnd);
       final width = _dictInt(dictText, '/Width');
       final height = _dictInt(dictText, '/Height');
       final bpc = _dictInt(dictText, '/BitsPerComponent') ?? 1;
@@ -281,52 +319,170 @@ class PdfFrameExtractor {
     return c;
   }
 
-  static List<Uint8List> _invert(List<Uint8List> matrix) => [
-        for (final row in matrix)
-          Uint8List.fromList([for (final v in row) v == 0 ? 1 : 0]),
-      ];
-
   // --- Code sampling ------------------------------------------------------
 
   /// Tries to parse a pixel matrix as a Middle Out grid or barcode.
   /// Returns the frame blob only when it parses as a valid frame.
+  /// Branches on the image aspect; each branch falls through to the next
+  /// on a parse failure, so a misclassified image only costs a failed
+  /// parse attempt, never a wrong frame.
   static Uint8List? _tryParseCode(List<Uint8List> matrix) {
     final height = matrix.length;
     if (height == 0) return null;
     final width = matrix[0].length;
-    // 2D grid: square image, quiet zone of 4 modules (fall back to 0).
+    // 1. Stacked-row barcode (old format): exact structural match on the
+    // row width and band pitch. Runs first because a bar-grid can share
+    // the aspect of a short stacked barcode by coincidence; the
+    // guard-bar check rejects non-barcodes below.
+    final stacked = _tryStackedBarcode(matrix, width, height);
+    if (stacked != null) return stacked;
+    // 2. Bar-grid (new barcode): aspect ~5.657, no quiet zone.
+    if (_nearAspect(width / height, CodeGrid.barcodeAspect)) {
+      final blob = _tryGrid(matrix, 0, 0, width, height);
+      if (blob != null) return blob;
+    }
+    // 3. Rectangular QR grid (new format): aspect ~1.414, no quiet zone.
+    if (_nearAspect(width / height, CodeGrid.qrAspect)) {
+      final blob = _tryGrid(matrix, 0, 0, width, height);
+      if (blob != null) return blob;
+    }
+    // 4. Square grid (old format / cover manifest): quiet zone of
+    // 4 modules (fall back to 0).
     if (width == height) {
       for (final quiet in [CodeGrid.quietModules, 0]) {
         final n = width - 2 * quiet;
         if (n < CodeGrid.minSize) continue;
-        final grid = List<Uint8List>.generate(
-          n,
-          (r) => Uint8List.sublistView(matrix[r + quiet], quiet, quiet + n),
-        );
-        final blob = _parseGridBlob(grid);
+        final blob = _tryGrid(matrix, quiet, quiet, n, n);
         if (blob != null) return blob;
       }
     }
-    // Stacked barcode: 528 bars per row, barPx 2 (fall back to 1),
-    // rows stacked at 24 px + 4 px gap (see PdfDocument).
+    return null;
+  }
+
+  /// True when [aspect] is within tolerance of [target]. Grid aspects
+  /// land within 0.5/h (<= 0.016 for h >= 32) of their nominal value,
+  /// while the formats sit 0.4+ apart, so 0.05 separates them cleanly.
+  static bool _nearAspect(double aspect, double target) =>
+      (aspect - target).abs() < 0.05;
+
+  /// Parses the w x h grid at (r0, c0) of [matrix], auto-detecting the
+  /// polarity from the top-left finder first and falling back to the
+  /// opposite polarity when the finder is damaged.
+  static Uint8List? _tryGrid(
+    List<Uint8List> matrix,
+    int r0,
+    int c0,
+    int w,
+    int h,
+  ) {
+    final inverted = _finderSaysInverted(matrix, r0, c0);
+    final blob = _parseGridBlob(
+      _subGrid(matrix, r0, c0, w, h, invert: inverted),
+    );
+    if (blob != null) return blob;
+    return _parseGridBlob(
+      _subGrid(matrix, r0, c0, w, h, invert: !inverted),
+    );
+  }
+
+  /// Extracts the w x h sub-grid at (r0, c0), optionally inverting the
+  /// bits (dark pages) as it copies — no full-matrix inversion.
+  static List<Uint8List> _subGrid(
+    List<Uint8List> matrix,
+    int r0,
+    int c0,
+    int w,
+    int h, {
+    required bool invert,
+  }) {
+    return List<Uint8List>.generate(h, (r) {
+      final row = Uint8List(w);
+      final src = matrix[r0 + r];
+      for (var c = 0; c < w; c++) {
+        row[c] = invert ? src[c0 + c] ^ 1 : src[c0 + c];
+      }
+      return row;
+    });
+  }
+
+  /// True when the 7x7 top-left finder at (r0, c0) matches the expected
+  /// pattern better inverted than as-is — i.e. the page is dark.
+  /// The finder is an outer black ring, a white middle ring and a black
+  /// 3x3 core; on a dark page every bit flips. A tie (damaged finder)
+  /// reads as light, and [_tryGrid] retries inverted.
+  static bool _finderSaysInverted(List<Uint8List> matrix, int r0, int c0) {
+    if (r0 + 7 > matrix.length || c0 + 7 > matrix[0].length) return false;
+    var matchNormal = 0;
+    var matchInverted = 0;
+    for (var dr = 0; dr < 7; dr++) {
+      for (var dc = 0; dc < 7; dc++) {
+        final onRing = dr == 0 || dr == 6 || dc == 0 || dc == 6;
+        final inCore = dr >= 2 && dr <= 4 && dc >= 2 && dc <= 4;
+        final expected = (onRing || inCore) ? 1 : 0;
+        if (matrix[r0 + dr][c0 + dc] == expected) {
+          matchNormal++;
+        } else {
+          matchInverted++;
+        }
+      }
+    }
+    return matchInverted > matchNormal;
+  }
+
+  /// Tries the stacked-row barcode path (old format): 528 bars per row,
+  /// barPx 2 (fall back to 1), rows stacked at 24 px + 4 px gap.
+  /// Polarity comes from the guard bars — the first band's start guard
+  /// is 4 black bars, so an all-white guard means a dark page — with
+  /// the opposite polarity as fallback.
+  static Uint8List? _tryStackedBarcode(
+    List<Uint8List> matrix,
+    int width,
+    int height,
+  ) {
     for (final barPx in [PdfBarcodeGeometry.barPx, 1]) {
       if (width % (CodeGrid.barcodeRowBars * barPx) != 0) continue;
       const rowStride = PdfBarcodeGeometry.rowPx + PdfBarcodeGeometry.gapPx;
       if (height % rowStride != 0) continue;
       final rowCount = height ~/ rowStride;
-      final rows = <Uint8List>[];
-      for (var r = 0; r < rowCount; r++) {
-        final y = r * rowStride + PdfBarcodeGeometry.rowPx ~/ 2;
-        final bars = Uint8List(CodeGrid.barcodeRowBars);
-        for (var b = 0; b < CodeGrid.barcodeRowBars; b++) {
-          bars[b] = matrix[y][b * barPx + barPx ~/ 2];
-        }
-        rows.add(bars);
+      const y = PdfBarcodeGeometry.rowPx ~/ 2;
+      var guardBlack = 0;
+      for (var b = 0; b < 4; b++) {
+        if (matrix[y][b * barPx + barPx ~/ 2] == 1) guardBlack++;
       }
-      final blob = _parseBarcodeBlob(rows);
+      final inverted = guardBlack == 0;
+      final blob = _parseBarcodeBlob(
+        _sampleBarcodeRows(matrix, barPx, rowCount, invert: inverted),
+      );
       if (blob != null) return blob;
+      final flipped = _parseBarcodeBlob(
+        _sampleBarcodeRows(matrix, barPx, rowCount, invert: !inverted),
+      );
+      if (flipped != null) return flipped;
     }
     return null;
+  }
+
+  /// Samples stacked barcode rows out of [matrix]: one sample row per
+  /// band (its vertical middle), one sample per bar (its centre),
+  /// optionally inverted.
+  static List<Uint8List> _sampleBarcodeRows(
+    List<Uint8List> matrix,
+    int barPx,
+    int rowCount, {
+    required bool invert,
+  }) {
+    const rowStride = PdfBarcodeGeometry.rowPx + PdfBarcodeGeometry.gapPx;
+    final rows = <Uint8List>[];
+    for (var r = 0; r < rowCount; r++) {
+      final y = r * rowStride + PdfBarcodeGeometry.rowPx ~/ 2;
+      final bars = Uint8List(CodeGrid.barcodeRowBars);
+      for (var b = 0; b < CodeGrid.barcodeRowBars; b++) {
+        final bit = matrix[y][b * barPx + barPx ~/ 2];
+        bars[b] = invert ? bit ^ 1 : bit;
+      }
+      rows.add(bars);
+    }
+    return rows;
   }
 
   static Uint8List? _parseGridBlob(List<Uint8List> grid) {

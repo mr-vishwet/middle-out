@@ -68,7 +68,7 @@ const int kFlagEncrypted = 0x01;
 /// Flag: this frame is in the last parity group.
 const int kFlagLastGroup = 0x02;
 
-/// Set when the frames were rendered as stacked-row barcodes rather than
+/// Set when the frames were rendered as bar-grid barcodes rather than
 /// 2D grids. Recorded so the decode UI knows which scanner to offer; the
 /// image parser itself auto-detects by aspect ratio.
 const int kFlagBarcode = 0x04;

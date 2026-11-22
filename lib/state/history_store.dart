@@ -57,7 +57,7 @@ class HistoryRecord {
   /// 8-frame groups in the encode.
   final int groupCount;
 
-  /// True when the frames were rendered as stacked barcodes.
+  /// True when the frames were rendered as barcodes.
   final bool barcode;
 
   /// True when the payload was encrypted.

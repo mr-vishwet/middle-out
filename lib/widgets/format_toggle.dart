@@ -1,9 +1,9 @@
 import 'package:material_ui/material_ui.dart';
 
-/// Format toggle: QR-style grid vs stacked-row barcode. Default is grid.
+/// Format toggle: QR-style grid vs bar-grid barcode. Default is grid.
 ///
 /// Both render the same frames — the toggle only changes how the payload
-/// is drawn on the page (2D modules vs 1D bars).
+/// is drawn on the page (2D modules vs tall thin bars).
 class FormatToggle extends StatelessWidget {
   /// Creates a format toggle for the current [barcode] mode.
   const FormatToggle({
@@ -12,7 +12,7 @@ class FormatToggle extends StatelessWidget {
     super.key,
   });
 
-  /// True for stacked-row barcode, false for the 2D grid.
+  /// True for the bar-grid barcode, false for the 2D grid.
   final bool barcode;
 
   /// Called when the format changes.
@@ -45,7 +45,7 @@ class FormatToggle extends StatelessWidget {
         const SizedBox(height: 6),
         Text(
           barcode
-              ? 'Stacked rows of bars — scans like a barcode, same frames.'
+              ? 'Tall thin bars, full-bleed — same frames, same decode.'
               : 'One big 2D code per page, logo tile in the centre.',
           style: theme.textTheme.bodySmall,
         ),

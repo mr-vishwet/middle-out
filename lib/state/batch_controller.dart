@@ -46,6 +46,7 @@ class BatchItem {
     this.bytes,
     this.barcode = false,
     this.encrypted = true,
+    this.pdfDark = false,
     this.passphrase = '',
     this.status = BatchStatus.queued,
     this.progress = 0,
@@ -77,6 +78,9 @@ class BatchItem {
   /// This item's encryption toggle.
   final bool encrypted;
 
+  /// This item's PDF theme (false = light, true = dark).
+  final bool pdfDark;
+
   /// This item's passphrase (memory only, never persisted).
   final String passphrase;
 
@@ -105,6 +109,7 @@ class BatchItem {
   BatchItem copyWith({
     bool? barcode,
     bool? encrypted,
+    bool? pdfDark,
     String? passphrase,
     BatchStatus? status,
     double? progress,
@@ -123,6 +128,7 @@ class BatchItem {
         bytes: bytes,
         barcode: barcode ?? this.barcode,
         encrypted: encrypted ?? this.encrypted,
+        pdfDark: pdfDark ?? this.pdfDark,
         passphrase: passphrase ?? this.passphrase,
         status: status ?? this.status,
         progress: progress ?? this.progress,
@@ -138,6 +144,7 @@ class BatchItem {
     PickedRef ref, {
     bool barcode = false,
     bool encrypted = true,
+    bool pdfDark = false,
   }) =>
       BatchItem(
         id: HistoryRecord.newId(),
@@ -147,6 +154,7 @@ class BatchItem {
         bytes: ref.bytes,
         barcode: barcode,
         encrypted: encrypted,
+        pdfDark: pdfDark,
       );
 
   /// Serialises the item's metadata (no bytes, no passphrase).
@@ -157,6 +165,7 @@ class BatchItem {
         'path': path,
         'barcode': barcode,
         'encrypted': encrypted,
+        'pdfDark': pdfDark,
       };
 
   /// Parses persisted metadata. Only path-based items survive a restart.
@@ -167,6 +176,7 @@ class BatchItem {
         path: json['path'] as String?,
         barcode: json['barcode'] as bool? ?? false,
         encrypted: json['encrypted'] as bool? ?? true,
+        pdfDark: json['pdfDark'] as bool? ?? false,
       );
 }
 
@@ -276,6 +286,7 @@ class BatchController extends ChangeNotifier {
     String id, {
     bool? barcode,
     bool? encrypted,
+    bool? pdfDark,
     String? passphrase,
   }) {
     items = [
@@ -284,6 +295,7 @@ class BatchController extends ChangeNotifier {
           item.copyWith(
             barcode: barcode,
             encrypted: encrypted,
+            pdfDark: pdfDark,
             passphrase: passphrase,
           )
         else
@@ -372,12 +384,13 @@ class BatchController extends ChangeNotifier {
       _update(
         items[index].copyWith(
           progress: 0.85,
-          progressLabel: 'Building PDF…',
+          progressLabel: 'Creating images…',
         ),
       );
       final (pdf, stats) = await PdfDocument.build(
         encoded,
         item.name,
+        dark: item.pdfDark,
         onProgress: (fraction, label) {
           _update(
             items[index].copyWith(

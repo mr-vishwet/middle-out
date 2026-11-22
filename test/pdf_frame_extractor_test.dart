@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:middle_out/codec/code_grid.dart';
 import 'package:middle_out/codec/encoder.dart';
 import 'package:middle_out/codec/frame.dart';
+import 'package:middle_out/codec/logo_tile.dart';
 import 'package:middle_out/services/pdf_frame_extractor.dart';
 
 /// Builds a minimal PDF holding one 1-bit image XObject.
@@ -47,9 +48,31 @@ Uint8List fixturePdf(List<Uint8List> pixels, int width, int height) {
   return out.toBytes();
 }
 
-/// Grid matrix plus quiet zone, as image pixels.
+/// Builds a minimal PDF holding one 1-bit code image XObject plus the
+/// RGB logo tile XObject, as the real writer emits.
+Uint8List fixturePdfWithLogo(List<Uint8List> pixels, int width, int height) {
+  final codePdf = fixturePdf(pixels, width, height);
+  final logoDeflate = const ZLibEncoder().encode(LogoTile.rgb);
+  final logo = BytesBuilder()
+    ..add(
+      ascii.encode(
+        '2 0 obj\n<< /Type /XObject /Subtype /Image /Width 64 /Height 64 '
+        '/BitsPerComponent 8 /ColorSpace /DeviceRGB '
+        '/Filter /FlateDecode /Length ${logoDeflate.length} >>\nstream\n',
+      ),
+    )
+    ..add(logoDeflate)
+    ..add(ascii.encode('\nendstream\nendobj\n'));
+  return (BytesBuilder()
+        ..add(codePdf)
+        ..add(logo.toBytes()))
+      .toBytes();
+}
+
+/// Square grid matrix plus quiet zone, as image pixels (old format and
+/// the cover manifest grid).
 List<Uint8List> gridPixels(Uint8List frameBytes) {
-  final grid = CodeGrid.buildGrid(frameBytes);
+  final grid = CodeGrid.buildGrid(frameBytes, aspect: 1.0);
   final n = grid.length;
   const quiet = CodeGrid.quietModules;
   final size = n + 2 * quiet;
@@ -59,6 +82,14 @@ List<Uint8List> gridPixels(Uint8List frameBytes) {
   }
   return rows;
 }
+
+/// Rectangular QR grid matrix, no quiet zone (new full-bleed format).
+List<Uint8List> rectGridPixels(Uint8List frameBytes) =>
+    CodeGrid.buildGrid(frameBytes);
+
+/// Bar-grid matrix, no quiet zone (new barcode format).
+List<Uint8List> barGridPixels(Uint8List frameBytes) =>
+    CodeGrid.buildGrid(frameBytes, aspect: CodeGrid.barcodeAspect);
 
 /// Barcode rows as image pixels (barPx 2, row band 24 + gap 4).
 List<Uint8List> barcodePixels(Uint8List frameBytes) {
@@ -84,11 +115,47 @@ List<Uint8List> barcodePixels(Uint8List frameBytes) {
   return pixels;
 }
 
+/// Inverts a pixel matrix (dark-page polarity).
+List<Uint8List> invertPixels(List<Uint8List> pixels) => [
+      for (final row in pixels)
+        Uint8List.fromList([for (final v in row) v ^ 1]),
+    ];
+
 void main() {
   group('PdfFrameExtractor', () {
-    test('recovers a frame from a grid image XObject', () {
+    test('recovers a frame from a rectangular QR image XObject', () {
       final data = Uint8List.fromList(
         'Middle Out PDF fixture — grid mode. '.codeUnits,
+      );
+      final frame = Encoder.encode(data).frames.first;
+      final pixels = rectGridPixels(frame.toBytes());
+      final pdf = fixturePdf(pixels, pixels[0].length, pixels.length);
+      final extraction = PdfFrameExtractor.extract(pdf);
+      expect(extraction.imagesFound, 1);
+      expect(extraction.imagesParsed, 1);
+      expect(extraction.frames.length, 1);
+      final recovered = Frame.fromBytes(extraction.frames.first);
+      expect(recovered.frameIndex, frame.frameIndex);
+      expect(recovered.payload, frame.payload);
+    });
+
+    test('recovers a frame from a bar-grid image XObject', () {
+      final data = Uint8List.fromList(
+        'Middle Out PDF fixture — bar-grid mode. '.codeUnits,
+      );
+      final frame = Encoder.encode(data, barcode: true).frames.first;
+      final pixels = barGridPixels(frame.toBytes());
+      final pdf = fixturePdf(pixels, pixels[0].length, pixels.length);
+      final extraction = PdfFrameExtractor.extract(pdf);
+      expect(extraction.frames.length, 1);
+      final recovered = Frame.fromBytes(extraction.frames.first);
+      expect(recovered.payload, frame.payload);
+      expect(recovered.isBarcode, isTrue);
+    });
+
+    test('recovers a frame from a square grid image XObject', () {
+      final data = Uint8List.fromList(
+        'Middle Out PDF fixture — square grid. '.codeUnits,
       );
       final frame = Encoder.encode(data).frames.first;
       final pixels = gridPixels(frame.toBytes());
@@ -102,7 +169,7 @@ void main() {
       expect(recovered.payload, frame.payload);
     });
 
-    test('recovers a frame from a barcode image XObject', () {
+    test('recovers a frame from a stacked barcode image XObject', () {
       final data = Uint8List.fromList(
         'Middle Out PDF fixture — barcode mode. '.codeUnits,
       );
@@ -114,6 +181,64 @@ void main() {
       final recovered = Frame.fromBytes(extraction.frames.first);
       expect(recovered.payload, frame.payload);
       expect(recovered.isBarcode, isTrue);
+    });
+
+    test('polarity auto-detect: inverted QR grid still decodes', () {
+      final data = Uint8List.fromList(
+        'Middle Out PDF fixture — dark grid. '.codeUnits,
+      );
+      final frame = Encoder.encode(data).frames.first;
+      final pixels = invertPixels(rectGridPixels(frame.toBytes()));
+      final pdf = fixturePdf(pixels, pixels[0].length, pixels.length);
+      final extraction = PdfFrameExtractor.extract(pdf);
+      expect(extraction.frames.length, 1);
+      final recovered = Frame.fromBytes(extraction.frames.first);
+      expect(recovered.payload, frame.payload);
+    });
+
+    test('polarity auto-detect: inverted bar-grid still decodes', () {
+      final data = Uint8List.fromList(
+        'Middle Out PDF fixture — dark bar-grid. '.codeUnits,
+      );
+      final frame = Encoder.encode(data, barcode: true).frames.first;
+      final pixels = invertPixels(barGridPixels(frame.toBytes()));
+      final pdf = fixturePdf(pixels, pixels[0].length, pixels.length);
+      final extraction = PdfFrameExtractor.extract(pdf);
+      expect(extraction.frames.length, 1);
+      final recovered = Frame.fromBytes(extraction.frames.first);
+      expect(recovered.payload, frame.payload);
+      expect(recovered.isBarcode, isTrue);
+    });
+
+    test('polarity auto-detect: inverted stacked barcode still decodes',
+        () {
+      final data = Uint8List.fromList(
+        'Middle Out PDF fixture — dark stacked barcode. '.codeUnits,
+      );
+      final frame = Encoder.encode(data, barcode: true).frames.first;
+      final pixels = invertPixels(barcodePixels(frame.toBytes()));
+      final pdf = fixturePdf(pixels, pixels[0].length, pixels.length);
+      final extraction = PdfFrameExtractor.extract(pdf);
+      expect(extraction.frames.length, 1);
+      final recovered = Frame.fromBytes(extraction.frames.first);
+      expect(recovered.payload, frame.payload);
+      expect(recovered.isBarcode, isTrue);
+    });
+
+    test('skips the RGB logo XObject and still recovers the frame', () {
+      final data = Uint8List.fromList(
+        'Middle Out PDF fixture — logo present. '.codeUnits,
+      );
+      final frame = Encoder.encode(data).frames.first;
+      final pixels = rectGridPixels(frame.toBytes());
+      final pdf = fixturePdfWithLogo(pixels, pixels[0].length, pixels.length);
+      final extraction = PdfFrameExtractor.extract(pdf);
+      expect(extraction.imagesFound, 2);
+      // The logo is never decoded: only the 1-bit code image is parsed.
+      expect(extraction.imagesParsed, 1);
+      expect(extraction.frames.length, 1);
+      final recovered = Frame.fromBytes(extraction.frames.first);
+      expect(recovered.payload, frame.payload);
     });
 
     test('skips the cover manifest grid (text, not a frame)', () {

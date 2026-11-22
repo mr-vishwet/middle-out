@@ -141,8 +141,11 @@ class EncodeController extends ChangeNotifier {
   /// Picked file reference (bytes loaded lazily).
   PickedRef? file;
 
-  /// QR-style grid (false) or stacked-row barcode (true). Default: grid.
+  /// QR-style grid (false) or bar-grid barcode (true). Default: grid.
   bool barcode = false;
+
+  /// Dark PDF theme (white code on black pages). Default: light.
+  bool pdfDark = false;
 
   /// Encrypted (default ON): payload is not human-readable when scanned.
   bool encrypted = true;
@@ -221,6 +224,12 @@ class EncodeController extends ChangeNotifier {
   /// Sets the code format.
   void setBarcode(bool value) {
     barcode = value;
+    notifyListeners();
+  }
+
+  /// Sets the PDF theme (false = light, true = dark).
+  void setPdfDark(bool value) {
+    pdfDark = value;
     notifyListeners();
   }
 
@@ -367,13 +376,14 @@ class EncodeController extends ChangeNotifier {
       // Cancelled (or reset) while the encode stages were running.
       if (generation != _generation) return;
       progress = 0.85;
-      progressLabel = 'Building PDF…';
+      progressLabel = 'Creating images…';
       notifyListeners();
       await Future<void>.delayed(Duration.zero);
 
       final (bytes, stats) = await PdfDocument.build(
         encoded,
         current.name,
+        dark: pdfDark,
         onProgress: (fraction, label) {
           progress = 0.85 + fraction * 0.15;
           progressLabel = label;

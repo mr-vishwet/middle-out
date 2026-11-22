@@ -115,12 +115,10 @@ class PdfPreviewScreen extends StatelessWidget {
                       ),
                       const SizedBox(height: 8),
                       FrameCodeView(
-                        grid: result.barcode
-                            ? null
-                            : CodeGrid.buildGrid(firstRaw),
-                        barcodeRows: result.barcode
-                            ? CodeGrid.buildBarcodeRows(firstRaw)
-                            : null,
+                        grid: CodeGrid.buildFrameGrid(
+                          firstRaw,
+                          barcode: result.barcode,
+                        ),
                       ),
                       const SizedBox(height: 8),
                       Text(

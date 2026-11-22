@@ -1,8 +1,11 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
+
 import 'code_grid.dart';
 import 'encoder.dart';
+import 'logo_tile.dart';
 import 'pdf_writer.dart';
 import 'png_encode.dart';
 
@@ -30,12 +33,14 @@ class BuildCancelledException implements Exception {
   String toString() => 'Build cancelled';
 }
 
-/// Assembles the encoded PDF: 1 cover page + 1 full-page code page per
-/// frame, each frame embedded as a 1-bit image XObject.
+/// Assembles the encoded PDF: 1 portrait cover page + 1 landscape
+/// full-bleed code page per frame, each frame embedded as a 1-bit image
+/// XObject with the logo tile over its centre.
 ///
-/// The cover carries a small Middle Out Code grid with the decode manifest
-/// (file name, sizes, SHA-256, frame count) — scannable by the app. A real
-/// ISO QR cover code (readable by any phone camera) is a v0.2 item.
+/// The cover carries a small square Middle Out Code grid with the decode
+/// manifest (file name, sizes, SHA-256, frame count) — scannable by the
+/// app. A real ISO QR cover code (readable by any phone camera) is a
+/// v0.2 item.
 ///
 /// The document is assembled by [RawPdfWriter], not the `pdf` package:
 /// the package has no public API for a 1-bit image XObject, and its
@@ -43,80 +48,58 @@ class BuildCancelledException implements Exception {
 /// 8-bit RGB plus an alpha SMask, and re-deflated ~2.3 MB per page inside
 /// `doc.save()` — ~194 ms per frame on the VM. The writer embeds the
 /// already-deflated 1-bit pixels verbatim, so serialising a page costs
-/// ~1 ms and the whole build runs at the per-frame loop rate (~14 ms per
-/// frame in grid mode, ~31 ms in barcode mode, measured on the VM).
+/// ~1 ms and the whole build runs at the per-frame loop rate.
 class PdfDocument {
-  /// Barcode rendering geometry inside the PDF image (pixels per bar/row).
-  static const int barcodeBarPx = 2;
-
-  /// Height of one barcode row in the PDF image, in pixels.
-  static const int barcodeRowPx = 24;
-
-  /// Vertical gap between barcode rows in the PDF image, in pixels.
-  static const int barcodeGapPx = 4;
-
   /// Builds the PDF bytes for [result] (the encode of [fileName]).
   ///
-  /// Reports progress through [onProgress] — fraction 0..1 of the PDF
-  /// build plus a human-readable label ('Building PDF… page N of M') —
-  /// and yields to the event loop after every frame, so the UI can
-  /// repaint the progress bar and respond to taps (Cancel) during a
-  /// long build. Without the yields the whole build blocks the UI
-  /// thread and the bar sits pinned at its last value for minutes on
-  /// large files. When [shouldCancel] returns true the build stops
-  /// promptly by throwing [BuildCancelledException]. Neither callback
-  /// changes the PDF bytes: the loop body is untouched.
+  /// Two phases, reported through [onProgress] — fraction 0..1 of the
+  /// PDF build plus a human-readable label:
+  /// * Phase 1, "Creating images… N of M": builds every frame image
+  ///   (grid + deflate), yielding to the event loop after every frame so
+  ///   the UI can repaint the progress bar and respond to taps (Cancel)
+  ///   during a long build. Without the yields the whole build blocks
+  ///   the UI thread and the bar sits pinned at its last value for
+  ///   minutes on large files.
+  /// * Phase 2, "Binding into PDF…": assembles the document via
+  ///   [RawPdfWriter] (cover + frame pages) and serialises it.
+  ///
+  /// When [shouldCancel] returns true the build stops promptly by
+  /// throwing [BuildCancelledException]. Neither callback changes the
+  /// PDF bytes: the loop body is untouched.
+  ///
+  /// [dark] builds the dark variant: code pages get a black background
+  /// and inverted 1-bit pixels (white code on black). The cover page
+  /// stays light in both variants.
   static Future<(Uint8List, PdfStats)> build(
     EncodeResult result,
     String fileName, {
     EncodeProgress? onProgress,
     bool Function()? shouldCancel,
+    bool dark = false,
   }) async {
-    final writer = RawPdfWriter();
-    final stats = result.stats;
+    final frames = result.frames;
 
-    // --- Cover page ---
-    final manifest = _manifestText(result, fileName);
-    final manifestGrid = CodeGrid.buildGrid(
-      Uint8List.fromList(utf8.encode(manifest)),
-    );
-    final (manifestW, manifestH, manifestDeflate) = _gridDeflate(manifestGrid);
-    writer.addCoverPage(
-      manifestLines: manifest.split('\n'),
-      imageWidth: manifestW,
-      imageHeight: manifestH,
-      imageDeflate: manifestDeflate,
-    );
-
-    // --- One full-page code page per frame ---
-    final totalPages = 1 + result.frames.length;
-    for (var i = 0; i < result.frames.length; i++) {
-      final frame = result.frames[i];
-      final raw = frame.toBytes();
-      final int imageWidth, imageHeight;
-      final Uint8List deflate;
-      if (result.barcode) {
-        (imageWidth, imageHeight, deflate) = _barcodeDeflate(
-          CodeGrid.buildBarcodeRows(raw),
-        );
-      } else {
-        (imageWidth, imageHeight, deflate) = _gridDeflate(
-          CodeGrid.buildGrid(raw),
-        );
-      }
-      final kind = frame.isData ? 'DATA' : 'PARITY';
-      writer.addFramePage(
-        imageWidth: imageWidth,
-        imageHeight: imageHeight,
-        imageDeflate: deflate,
-        caption:
-            'Frame ${frame.frameIndex + 1} of ${stats.frameCount}  ·  '
-            '$kind  ·  Group ${frame.groupIndex + 1}  ·  '
-            '${frame.payload.length} bytes',
+    // --- Phase 1: build every frame image (grid + deflate) ---
+    final images = <_FrameImage>[];
+    for (var i = 0; i < frames.length; i++) {
+      final raw = frames[i].toBytes();
+      final grid = CodeGrid.buildFrameGrid(raw, barcode: result.barcode);
+      final deflate = PngEncode.deflate1Bit(
+        grid,
+        grid[0].length,
+        grid.length,
+        dark: dark,
+      );
+      images.add(
+        _FrameImage(
+          width: grid[0].length,
+          height: grid.length,
+          deflate: deflate,
+        ),
       );
       onProgress?.call(
-        (i + 1) / result.frames.length,
-        'Building PDF… page ${i + 2} of $totalPages',
+        0.9 * (i + 1) / frames.length,
+        'Creating images… ${i + 1} of ${frames.length}',
       );
       if (shouldCancel?.call() == true) {
         throw const BuildCancelledException();
@@ -127,11 +110,54 @@ class PdfDocument {
       await Future<void>.delayed(Duration.zero);
     }
 
-    onProgress?.call(1, 'Saving PDF…');
+    // --- Phase 2: bind the document ---
+    onProgress?.call(0.95, 'Binding into PDF…');
+    if (shouldCancel?.call() == true) {
+      throw const BuildCancelledException();
+    }
+    await Future<void>.delayed(Duration.zero);
+
+    // The logo tile is deflated once per document; the writer shares one
+    // XObject across all frame pages.
+    final logoDeflate = Uint8List.fromList(
+      const ZLibEncoder().encode(LogoTile.rgb, level: 6),
+    );
+    final writer = RawPdfWriter(
+      logoDeflate: logoDeflate,
+      logoWidth: LogoTile.size,
+      logoHeight: LogoTile.size,
+    );
+
+    // Cover page (unchanged: portrait, manifest text + small square
+    // grid with its quiet zone, light in both variants).
+    final manifest = _manifestText(result, fileName);
+    final manifestGrid = CodeGrid.buildGrid(
+      Uint8List.fromList(utf8.encode(manifest)),
+      aspect: 1.0,
+    );
+    final (manifestW, manifestH, manifestDeflate) =
+        _coverGridDeflate(manifestGrid);
+    writer.addCoverPage(
+      manifestLines: manifest.split('\n'),
+      imageWidth: manifestW,
+      imageHeight: manifestH,
+      imageDeflate: manifestDeflate,
+    );
+
+    for (final image in images) {
+      writer.addFramePage(
+        imageWidth: image.width,
+        imageHeight: image.height,
+        imageDeflate: image.deflate,
+        dark: dark,
+      );
+    }
+
     final bytes = writer.build();
+    onProgress?.call(1, 'Binding into PDF…');
     return (
       bytes,
-      PdfStats(pages: 1 + result.frames.length, sizeBytes: bytes.length),
+      PdfStats(pages: 1 + frames.length, sizeBytes: bytes.length),
     );
   }
 
@@ -150,26 +176,38 @@ class PdfDocument {
     ].join('\n');
   }
 
-  /// Grid matrix -> (width, height, deflate), with a quiet zone of white
-  /// modules around the grid.
-  static (int, int, Uint8List) _gridDeflate(List<Uint8List> grid) {
-    final n = grid.length;
+  /// Cover grid matrix -> (width, height, deflate), with a quiet zone of
+  /// white modules around the grid (the cover keeps its quiet zone;
+  /// full-bleed code pages have none).
+  static (int, int, Uint8List) _coverGridDeflate(List<Uint8List> grid) {
+    final h = grid.length;
+    final w = grid[0].length;
     const quiet = CodeGrid.quietModules;
-    final size = n + 2 * quiet;
-    final rows = List<Uint8List>.generate(size, (_) => Uint8List(size));
-    for (var r = 0; r < n; r++) {
+    final width = w + 2 * quiet;
+    final height = h + 2 * quiet;
+    final rows = List<Uint8List>.generate(height, (_) => Uint8List(width));
+    for (var r = 0; r < h; r++) {
       rows[r + quiet].setAll(quiet, grid[r]);
     }
-    return (size, size, PngEncode.deflate1Bit(rows, size, size));
+    return (width, height, PngEncode.deflate1Bit(rows, width, height));
   }
+}
 
-  /// Barcode rows -> (width, height, deflate). Packed directly from the
-  /// bar rows — no full-pixel expansion (see [PngEncode.deflateBarcodeRows]).
-  static (int, int, Uint8List) _barcodeDeflate(List<Uint8List> rows) =>
-      PngEncode.deflateBarcodeRows(
-        rows,
-        barPx: barcodeBarPx,
-        rowPx: barcodeRowPx,
-        gapPx: barcodeGapPx,
-      );
+/// One built frame image, ready to bind into the PDF.
+class _FrameImage {
+  /// Creates a frame image.
+  const _FrameImage({
+    required this.width,
+    required this.height,
+    required this.deflate,
+  });
+
+  /// Image width in pixels (grid modules).
+  final int width;
+
+  /// Image height in pixels (grid modules).
+  final int height;
+
+  /// Zlib-compressed packed 1-bit pixels (predictor 1).
+  final Uint8List deflate;
 }

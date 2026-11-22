@@ -58,13 +58,18 @@ void main() {
         final (pdf, stats) = await PdfDocument.build(encoded, 'roundtrip.bin');
         expect(stats.pages, 1 + encoded.frames.length);
 
-        // New format: 1-bit DeviceGray XObjects, no RGB expansion, no SMask,
-        // no nested DecodeParms dict (the extractor's scan requires that).
+        // New format: 1-bit DeviceGray code XObjects plus ONE shared 8-bit
+        // RGB logo XObject; no SMask, no nested DecodeParms dict (the
+        // extractor's scan requires that). Cover portrait, code pages
+        // landscape.
         expect(bytesContain(pdf, '/BitsPerComponent 1'), isTrue);
         expect(bytesContain(pdf, '/ColorSpace /DeviceGray'), isTrue);
-        expect(bytesContain(pdf, '/DeviceRGB'), isFalse);
+        expect(bytesContain(pdf, '/BitsPerComponent 8'), isTrue);
+        expect(bytesContain(pdf, '/ColorSpace /DeviceRGB'), isTrue);
         expect(bytesContain(pdf, '/SMask'), isFalse);
         expect(bytesContain(pdf, '/DecodeParms'), isFalse);
+        expect(bytesContain(pdf, '/MediaBox [0 0 595.28 841.89]'), isTrue);
+        expect(bytesContain(pdf, '/MediaBox [0 0 841.89 595.28]'), isTrue);
 
         final extraction = PdfFrameExtractor.extract(pdf);
         expect(extraction.frames.length, encoded.frames.length);
@@ -85,7 +90,11 @@ void main() {
         final (pdf, stats) = await PdfDocument.build(encoded, 'roundtrip.bin');
         expect(stats.pages, 1 + encoded.frames.length);
         expect(bytesContain(pdf, '/BitsPerComponent 1'), isTrue);
-        expect(bytesContain(pdf, '/DeviceRGB'), isFalse);
+        // The logo tile is the only RGB image.
+        expect(bytesContain(pdf, '/ColorSpace /DeviceRGB'), isTrue);
+        expect(bytesContain(pdf, '/SMask'), isFalse);
+        expect(bytesContain(pdf, '/DecodeParms'), isFalse);
+        expect(bytesContain(pdf, '/MediaBox [0 0 841.89 595.28]'), isTrue);
 
         final extraction = PdfFrameExtractor.extract(pdf);
         expect(extraction.frames.length, encoded.frames.length);
@@ -97,6 +106,73 @@ void main() {
         );
       },
     );
+
+    test(
+      'dark grid mode: inverted pages extract and decode byte-identical',
+      () async {
+        final data = randomBytes(200 * 1024);
+        final encoded = Encoder.encode(data);
+        final (pdf, stats) = await PdfDocument.build(
+          encoded,
+          'roundtrip.bin',
+          dark: true,
+        );
+        expect(stats.pages, 1 + encoded.frames.length);
+
+        final extraction = PdfFrameExtractor.extract(pdf);
+        expect(extraction.frames.length, encoded.frames.length);
+        final decoded = Decoder.decode(extraction.frames);
+        expect(decoded, data);
+        expect(
+          sha256.convert(decoded).toString(),
+          sha256.convert(data).toString(),
+        );
+      },
+    );
+
+    test(
+      'dark barcode mode: inverted pages extract and decode byte-identical',
+      () async {
+        final data = randomBytes(200 * 1024);
+        final encoded = Encoder.encode(data, barcode: true);
+        final (pdf, stats) = await PdfDocument.build(
+          encoded,
+          'roundtrip.bin',
+          dark: true,
+        );
+        expect(stats.pages, 1 + encoded.frames.length);
+
+        final extraction = PdfFrameExtractor.extract(pdf);
+        expect(extraction.frames.length, encoded.frames.length);
+        final decoded = Decoder.decode(extraction.frames);
+        expect(decoded, data);
+        expect(
+          sha256.convert(decoded).toString(),
+          sha256.convert(data).toString(),
+        );
+      },
+    );
+
+    test('light and dark PDFs of the same encode carry the same frames',
+        () async {
+      final data = randomBytes(100 * 1024);
+      final encoded = Encoder.encode(data);
+      final (lightPdf, _) = await PdfDocument.build(encoded, 'same.bin');
+      final (darkPdf, _) = await PdfDocument.build(
+        encoded,
+        'same.bin',
+        dark: true,
+      );
+      // Same page count, different bytes (inverted pixels + bg rects).
+      expect(lightPdf.length, isNot(darkPdf.length));
+      final light = PdfFrameExtractor.extract(lightPdf);
+      final dark = PdfFrameExtractor.extract(darkPdf);
+      expect(dark.frames.length, light.frames.length);
+      expect(dark.frames.length, encoded.frames.length);
+      for (var i = 0; i < light.frames.length; i++) {
+        expect(dark.frames[i], light.frames[i]);
+      }
+    });
 
     test('encrypted encode round-trips through the new PDF', () async {
       final data = randomBytes(100 * 1024);

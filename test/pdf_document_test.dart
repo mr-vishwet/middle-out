@@ -45,19 +45,23 @@ void main() {
         },
       );
 
-      // One callback per frame plus the final 'Saving PDF…' call.
-      expect(fractions.length, encoded.frames.length + 1);
+      // One callback per frame (phase 1) plus the two phase-2 callbacks
+      // ('Binding into PDF…' at 0.95 and at 1.0).
+      final frames = encoded.frames.length;
+      expect(fractions.length, frames + 2);
       for (var i = 1; i < fractions.length; i++) {
         expect(fractions[i], greaterThanOrEqualTo(fractions[i - 1]));
       }
       expect(fractions.first, greaterThan(0));
       expect(fractions.last, 1.0);
-      expect(
-        labels.every((label) => label.contains('PDF')),
-        isTrue,
-        reason: 'the frames are already built — the label must say PDF',
-      );
-      expect(labels.first, contains('page 2 of'));
+      // Phase 1 labels: 'Creating images… N of M'.
+      for (var i = 0; i < frames; i++) {
+        expect(labels[i], 'Creating images… ${i + 1} of $frames');
+      }
+      // Phase 2 labels: 'Binding into PDF…'.
+      expect(labels[frames], 'Binding into PDF…');
+      expect(labels[frames + 1], 'Binding into PDF…');
+      expect(fractions[frames], 0.95);
       expect(sawYield, isTrue, reason: 'the build must yield per frame');
       expect(stats.pages, 1 + encoded.frames.length);
       expect(pdf.length, stats.sizeBytes);

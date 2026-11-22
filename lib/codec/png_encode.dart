@@ -14,11 +14,11 @@ import 'frame.dart';
 /// * [encode1Bit] — a complete PNG (IHDR, one zlib-compressed IDAT of
 ///   filter-0 scanlines, IEND). Kept for tests and tooling; the PDF
 ///   builder no longer uses it.
-/// * [deflate1Bit] / [deflateBarcodeRows] — just the zlib-compressed
-///   packed pixels (predictor 1: no filter bytes, no PNG wrapper), which
-///   [RawPdfWriter] embeds verbatim as a DeviceGray image XObject. No PNG
-///   decode/re-encode step ever runs on them, which is what makes the PDF
-///   build fast (see [RawPdfWriter]).
+/// * [deflate1Bit] — just the zlib-compressed packed pixels (predictor
+///   1: no filter bytes, no PNG wrapper), which [RawPdfWriter] embeds
+///   verbatim as a DeviceGray image XObject. No PNG decode/re-encode
+///   step ever runs on them, which is what makes the PDF build fast
+///   (see [RawPdfWriter]).
 class PngEncode {
   /// Encodes a [width] x [height] 1-bit image. [rows] is one byte per
   /// module (0 = white, 1 = black); each row must be [width] long.
@@ -52,90 +52,32 @@ class PngEncode {
   /// Level 6, not 9: on random grid data the two are the same speed and
   /// size (no matches to find), and on repetitive data level 6 is far
   /// faster (barcode raw: 16 ms vs 56 ms at level 9, +1% size).
-  static Uint8List deflate1Bit(List<Uint8List> rows, int width, int height) {
-    final packed = _packAndInvert(rows, width, height);
-    return Uint8List.fromList(const ZLibEncoder().encode(packed, level: 6));
-  }
-
-  /// Packs stacked barcode [rows] (each [rows.first.length] bars, 1 =
-  /// black) directly into zlib-compressed 1-bit pixels for a PDF image
-  /// XObject — no full-pixel expansion. Returns (width, height, deflate).
   ///
-  /// Each bar widens to [barPx] pixels, each row band repeats for
-  /// [rowPx] pixel rows, and [gapPx] all-white rows separate the bands.
-  /// Packing each bar row once and repeating it by byte copy is ~4x
-  /// faster than expanding to a full pixel matrix first (measured on a
-  /// full 64 KiB frame: 68 ms vs 222 ms at level 9; level 6 brings the
-  /// direct path to ~28 ms).
-  static (int, int, Uint8List) deflateBarcodeRows(
-    List<Uint8List> rows, {
-    required int barPx,
-    required int rowPx,
-    required int gapPx,
+  /// [dark] inverts the polarity for dark code pages: black modules
+  /// become white pixels (DeviceGray bit 1) and white modules become
+  /// black, so the code reads white-on-black over the page's black
+  /// background. The packer just skips its usual inversion.
+  static Uint8List deflate1Bit(
+    List<Uint8List> rows,
+    int width,
+    int height, {
+    bool dark = false,
   }) {
-    if (rows.isEmpty) {
-      throw ArgumentError('rows must not be empty');
-    }
-    final bars = rows.first.length;
-    final width = bars * barPx;
-    final height = rows.length * (rowPx + gapPx);
-    final stride = (width + 7) ~/ 8;
-    final padBits = stride * 8 - width;
-    final padMask = padBits > 0 ? 0xFF << padBits & 0xFF : 0xFF;
-    final raw = Uint8List(height * stride);
-    final whiteRow = Uint8List(stride)..fillRange(0, stride, 0xFF);
-    whiteRow[stride - 1] &= padMask;
-    for (var ri = 0; ri < rows.length; ri++) {
-      final row = rows[ri];
-      if (row.length != bars) {
-        throw ArgumentError('row $ri has length ${row.length}, expected $bars');
-      }
-      // Pack the bars into bytes, each bar [barPx] bits wide, MSB first.
-      final packed = Uint8List(stride);
-      var offset = 0;
-      var current = 0;
-      var bits = 0;
-      for (var bi = 0; bi < bars; bi++) {
-        for (var k = 0; k < barPx; k++) {
-          current = (current << 1) | (row[bi] & 1);
-          bits++;
-          if (bits == 8) {
-            packed[offset++] = current;
-            current = 0;
-            bits = 0;
-          }
-        }
-      }
-      if (bits > 0) packed[offset] = current << (8 - bits);
-      // DeviceGray 1-bit: 0 = black — invert our 1 = black modules.
-      // Pad bits past the row width must be zero after inversion.
-      for (var i = 0; i < stride; i++) {
-        packed[i] = (~packed[i]) & 0xFF;
-      }
-      packed[stride - 1] &= padMask;
-      final y0 = ri * (rowPx + gapPx);
-      for (var y = 0; y < rowPx; y++) {
-        raw.setRange((y0 + y) * stride, (y0 + y + 1) * stride, packed);
-      }
-      for (var y = 0; y < gapPx; y++) {
-        raw.setRange(
-          (y0 + rowPx + y) * stride,
-          (y0 + rowPx + y + 1) * stride,
-          whiteRow,
-        );
-      }
-    }
-    return (
-      width,
-      height,
-      Uint8List.fromList(const ZLibEncoder().encode(raw, level: 6)),
-    );
+    final packed = _packAndInvert(rows, width, height, dark: dark);
+    return Uint8List.fromList(const ZLibEncoder().encode(packed, level: 6));
   }
 
   /// Packs [rows] of 0/1 modules into bytes, MSB first, then inverts to
   /// DeviceGray polarity (0 = black, 1 = white). Pad bits past the row
   /// width are zero. No filter bytes — callers add them if needed.
-  static Uint8List _packAndInvert(List<Uint8List> rows, int width, int height) {
+  /// With [dark] the inversion is skipped, so the packed bits are the
+  /// module bits themselves: black modules render white, white black.
+  static Uint8List _packAndInvert(
+    List<Uint8List> rows,
+    int width,
+    int height, {
+    bool dark = false,
+  }) {
     if (rows.length != height) {
       throw ArgumentError('rows.length (${rows.length}) != height ($height)');
     }
@@ -161,9 +103,11 @@ class PngEncode {
       if (bits > 0) raw[offset] = current << (8 - bits);
     }
     // PNG greyscale / DeviceGray: 0 = black, 1 = white — invert our
-    // 1 = black modules.
-    for (var i = 0; i < raw.length; i++) {
-      raw[i] = (~raw[i]) & 0xFF;
+    // 1 = black modules. Skipped for dark pages (see [deflate1Bit]).
+    if (!dark) {
+      for (var i = 0; i < raw.length; i++) {
+        raw[i] = (~raw[i]) & 0xFF;
+      }
     }
     // Pad bits past the row width must be zero after inversion.
     final padBits = stride * 8 - width;

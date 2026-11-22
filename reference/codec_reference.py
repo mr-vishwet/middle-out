@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Middle Out codec — Python reference implementation (stdlib + PIL/reportlab).
+"""Middle Out codec — Python reference implementation (stdlib-only, + PIL
+for the image round-trip tests only).
 
 This is a byte-for-byte mirror of the Dart codec in lib/codec/. It exists so
 the wire format, erasure coding, encryption and PDF assembly can be validated
@@ -9,7 +10,10 @@ without a Flutter toolchain. The Dart side and this file MUST agree on:
   * zlib level-9 compression of the whole file before chunking,
   * ChaCha20 (RFC 8439) with a PBKDF2-HMAC-SHA256 derived key,
   * XOR parity: 6 DATA + 2 PARITY per group, trios (0,1,2) and (3,4,5),
-  * the Middle Out Code grid geometry and the stacked-row barcode format.
+  * the rectangular Middle Out Code grid geometry (QR aspect ~1.41421,
+    bar-grid aspect ~5.65685) and the legacy stacked-row barcode format,
+  * the full-bleed PDF: landscape code pages, light/dark variants, and
+    the centre logo-tile overlay.
 
 Run the test suite:  python3 test_codec_reference.py
 CLI:                  python3 codec_reference.py encode in.bin out.pdf
@@ -18,13 +22,13 @@ CLI:                  python3 codec_reference.py encode in.bin out.pdf
 
 from __future__ import annotations
 
+import base64
 import hashlib
-import io
+import math
 import os
+import re
 import struct
-import subprocess
 import sys
-import tempfile
 import zlib
 from dataclasses import dataclass, field
 
@@ -75,6 +79,201 @@ PBKDF2_ITERATIONS = 100_000
 SALT_LEN = 16
 NONCE_LEN = 12
 KEY_LEN = 32
+
+# --- Full-bleed code-page geometry (mirrors lib/codec/code_grid.dart) ---
+# Code pages are A4 LANDSCAPE and the code image spans the ENTIRE page
+# rect — no margins, no caption, no quiet zone. The cover stays portrait.
+CODE_PAGE_WIDTH = 841.89
+CODE_PAGE_HEIGHT = 595.28
+COVER_PAGE_WIDTH = 595.28
+COVER_PAGE_HEIGHT = 841.89
+# QR grids match the page aspect; the bar-grid stretches it 4x, so each
+# module draws as a tall thin rectangle and adjacent black modules merge
+# into vertical bars.
+QR_ASPECT = CODE_PAGE_WIDTH / CODE_PAGE_HEIGHT  # ~1.41421
+BARCODE_STRETCH = 4
+BARCODE_ASPECT = BARCODE_STRETCH * QR_ASPECT  # ~5.65685
+GRID_MIN_HEIGHT = 32
+GRID_HEIGHT_STEP = 2
+GRID_MAX_HEIGHT = 4096
+
+# --- Centre logo tile (docs/screenshots/app-icon.png, verified by eye:
+# black rounded-square tile, white pixel-M, green dot) ---
+# The reference is stdlib-only, so the 64x64 RGB pixels are embedded as a
+# base64 constant (decoded once from the PNG at development time with PIL,
+# composited on black, BOX-resampled 256 -> 64) instead of being read from
+# the PNG at runtime. The logo is a decorative overlay — never decoded —
+# so a pixel-exact match with the Dart side is not required.
+LOGO_SIZE = 64
+LOGO_RGB_PIXELS_B64 = (
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAUECg0LDxMQEhgUExoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "ExoWEhgUDxMQCg0LBAUEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABggHEBUSFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEBUSBggHAAAAAAAAAAAAAAAA"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgMCDhMQFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWDhMQAgMCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAUEEhgUFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "EhgUBAUEAAAAAAAAAAAAAAAAAAAAAAAAAAAABAUFExkVFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWExkVBAUFAAAAAAAAAAAAAAAAAAAAAgMCEhgUFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWEhgUAgMCAAAAAAAAAAAAAAAADhMQFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWDhMQAAAAAAAAAAAABggH"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWBggHAAAAAAAAEBUSFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUEhgUEhgU"
+    "EhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUEhgUEhgUEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEBUS"
+    "AAAABAUEFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWcXVyys7Ky87Ky87Ky87KmZ6aFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "mZ6ay87Ky87Ky87Kys7KcXZyFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWBAUECg0LFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L"
+    "8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy87KEhgUFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWCg0LDxMRFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWDxMQEhgUFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWmZ2Z8fTw8vXx8vXx8vXxyczIFRsXFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFRsXyczI8vXx8vXx8vXx8fTw"
+    "mZ2ZFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWGiAcQkhEQ0hEQ0hEQ0hEIykl"
+    "FBoWKC4qO0E9O0E9O0E9OT87FhwYFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFhwYOT87O0E9O0E9O0E9KC4qFBoWIyklQ0hEQ0hEQ0hEQkhEGiAcFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWrrKv9Pfz9Pfz9Pfz9Pfz3eDcKS8r7vDt9Pfz9Pfz9Pfz9PfzjJCMFRsXFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFRsXjJCM9Pfz9Pfz9Pfz9Pfz7vHtKS8r3eDc9Pfz"
+    "9Pfz9Pfz9PfzrrKvFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx"
+    "8vXx8vXx8vXxQ0hE9Pfz8vXx8vXx8vXx8vXxp6qnFRsXFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFRsXp6qn8vXx8vXx8vXx8vXx9PfzQ0hE8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxQ0hE9Pfz8vXx8vXx8vXx8vXxp6qnFRsX"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFRsXp6qn8vXx8vXx8vXx8vXx9Pfz"
+    "Q0hE8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgU"
+    "y8/L8vXx8vXx8vXx8vXx8vXxQ0hE9Pfz8vXx8vXx8vXx8vXxp6qnFRsXFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFRsXp6qn8vXx8vXx8vXx8vXx9PfzQ0hE8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUyczI8vXx8vXx8vXx8vXx8fTwP0RA9Pfz8vXx8vXx8vXx"
+    "8vXxpKekFRsXFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFRsXpKil8vXx8vXx"
+    "8vXx8vXx9PfzP0RA8fTw8vXx8vXx8vXx8vXxyczIEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWVltXqKuoqaypqaypqaypdnp3FRsXi46LqayoqayoqayopailQ0hEFBoWFRsXFRsXFRsXFRsXFRsXFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFRsXFRsXFRsXFRsXFRsXFBoWQ0hEpailqayoqayoqayoi4+LFRsXdnt4qaypqaypqaypqKuoVlpXFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWRktHkJWRkZWRkZWRkZWRYmZjFBoWFRsX"
+    "FRsXFRsXFRsXFRsXFBoWKjAsi5CMkJWRkJWRkJWRfoJ/Fx0ZFBoWFBoWFBoWFBoWFBoWFBoWFx0ZfoN/kJWRkJWRkJWRi5CMKjAs"
+    "FBoWFRsXFRsXFRsXFRsXFRsXFBoWYmdjkZWRkZWRkZWRkJWRRktHFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWExkVxsnG8vXx8vXx8vXx8vXx8PPvGR8bFBoWFBoWFBoWFBoWFBoWFRsXio6K8vXx8vXx8vXx8vXx8vXx"
+    "UFZRFBoWFBoWFBoWFBoWFBoWFBoWUVZS8vXx8vXx8vXx8vXx8vXxio6KFRsXFBoWFBoWFBoWFBoWFBoWGR8b8PLv8vXx8vXx8vXx"
+    "8vXxxsnFExkVFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx"
+    "8vXxHCIeFBoWFBoWFBoWFBoWFBoWFRsXj5OP8vXx8vXx8vXx8vXx8vXxVltXFBoWFBoWFBoWFBoWFBoWFBoWVltX8vXx8vXx8vXx"
+    "8vXx8vXxj5OPFRsXFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFRsXj5OP8vXx8vXx"
+    "8vXx8vXx8vXxVltXFBoWFBoWFBoWFBoWFBoWFBoWVltX8vXx8vXx8vXx8vXx8vXxj5OPFRsXFBoWFBoWFBoWFBoWFBoWHCIe8vXx"
+    "8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx"
+    "8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFRsXj5OP8vXx8vXx8vXx8vXx8vXxVltXFBoWFBoWFBoWFBoWFBoWFBoWVltX"
+    "8vXx8vXx8vXx8vXx8vXxj5OPFRsXFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWExkVuby58vXx8vXx8vXx8vXx5unlFx0ZFBoWFBoWFBoWFBoWFBoWFRsX"
+    "foJ+8vXx8vXx8vXx8vXx8/byQ0lFFBoWFBoWFBoWFBoWFBoWFBoWQ0lE8/by8vXx8vXx8vXx8vXxfoJ+FRsXFBoWFBoWFBoWFBoW"
+    "FBoWFx0Z5unl8vXx8vXx8vXx8vXxuby5ExkVFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWJComVFlVVFlVVFlVVFlVMTYyFBoWFBoWFBoWFBoWFBoWFBoWFBoWGB4aUlZTVltXVltXVltXRElFFBoWFBoWFBoWFRsWFRsW"
+    "FBoWFBoWFBoWRElFVltXVltXVltXUlZSGB4aFBoWFBoWFBoWFBoWFBoWFBoWFBoWMTYyVFlVVFlVVFlVVFlVJComFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWhYmG4+Xi4+Xi4+Xi4+XisbWyFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWMj4deZQveJMvMj4dFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWsrWy4+Xi4+Xi4+Xi4+XihYmFFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWMT0e"
+    "wu1AyPVCyPVCwu1AMT0eFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/L"
+    "EhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIe"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFRsWeZQvyPVCyPVCyPVCyPVCeZQvFRsWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFRsWeJQvyPVCyPVCyPVCyPVCeJMvFRsWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx"
+    "8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx"
+    "8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWMTwdwe1AyPVCyPVCwu1AMTwdFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWhImF4+Xi4+Xi4+Xi4+XisbWxFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWMT0deZQveJMuMT0dFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "sbWx4+Xi4+Xi4+Xi4+XihYmFFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWJCom"
+    "VFlVVFlVVFlVVFlVMTYzFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFRsWFRsWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWMTczVFlVVFlVVFlVVFlVJComFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWExkVub258vXx8vXx8vXx8vXx5unlFx0ZFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFx0Z5unm8vXx8vXx8vXx8vXxub25ExkVFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXx"
+    "y8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWExkVxsnG8vXx8vXx8vXx8vXx8PPv"
+    "GR8bFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWGR8b8PPv8vXx8vXx8vXx8vXxxsnGExkVFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWRUtHkJSQkZWRkZWRkZWRYGVhFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWYWVikZWR"
+    "kZWRkZWRkJSQRUpHFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWVltYqaypqayp"
+    "qaypqaypd3t4ExoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWExkVd3t4qaypqaypqaypqaypVltXFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUyMzI8vXx8vXx8vXx8vXx8fTwGiAcFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "GyEd8fTw8vXx8vXx8vXx8vXxyMzIEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgU"
+    "y8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgU"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWrrKu9Pfz9Pfz9Pfz9Pfz3eDcFhwYFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFhwY3eDc9Pfz9Pfz9Pfz9PfzrrKuFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWGSAcQkhEQ0hEQ0hEQ0hEIyklFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWIyklQ0hEQ0hEQ0hE"
+    "QkhEGSAcFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWmZ2a8fTw8vXx8vXx8vXx"
+    "yczIFRsXFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFRsXyczJ8vXx8vXx8vXx8fTwmZ2aFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx"
+    "8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx"
+    "8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWEhgUDxMRFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUy8/L8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWHCIe8vXx8vXx8vXx8vXx8vXxy8/LEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWDxMRCg0LFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "EhgUy87K8vXx8vXx8vXx8vXx8vXxHCIeFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWHCIe8vXx8vXx8vXx8vXx8vXxy87KEhgUFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWCg0LBAUEFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWcHVxys7Ky87Ky87Ky87KmZ2ZFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWmZ2Zy87Ky87Ky87Kys7KcHVxFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWBAUEAAAAEBUSFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWEhgUEhgUEhgUEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUEhgUEhgUEhgUFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWEBUSAAAAAAAABggHFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWBggHAAAAAAAAAAAA"
+    "DhMQFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWDhMQAAAAAAAAAAAAAAAAAgICEhgUFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUAgICAAAA"
+    "AAAAAAAAAAAAAAAABAUFExkVFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWExkVBAUFAAAAAAAAAAAAAAAAAAAAAAAAAAAABAUFEhgUFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhgUBAUF"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgMCDhMPFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWDhMPAgMCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    "BggGEBUSFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEBUSBggG"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAUECg0LDxMQEhcUFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoW"
+    "FBoWFBoWFBoWFBoWFBoWFBoWFBoWFBoWEhcUDxMQCg0LBAUEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+)
+LOGO_RGB_PIXELS = base64.b64decode(LOGO_RGB_PIXELS_B64)
+assert len(LOGO_RGB_PIXELS) == LOGO_SIZE * LOGO_SIZE * 3
+LOGO_DEFLATE = zlib.compress(LOGO_RGB_PIXELS, 6)
 
 
 class CodecError(Exception):
@@ -539,132 +738,245 @@ def decode(frame_blobs: list[bytes], passphrase: str | None = None) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Visual codes: Middle Out Code grid + stacked-row barcode
+# Visual codes: Middle Out Code grid + bar-grid barcode (+ legacy stacked rows)
 #
 # The frames are rendered as full-page codes. A real ISO QR code holds ~3 KB;
 # a Middle Out frame holds up to 64 KiB, so the 2D mode is a custom grid
 # (QR-style finders, timing patterns, centre tile reserved for the logo)
-# rather than an ISO QR code. Barcode mode stacks the payload as rows of
-# bars, PDF417-style. Both carry a 4-byte big-endian length prefix so the
-# parser knows where the payload ends and the padding begins.
+# rather than an ISO QR code. Barcode mode uses the SAME grid layout with a
+# 4x-stretched aspect: drawn into the full landscape page rect, the
+# non-uniform scale stretches each module into a tall thin rectangle, so
+# adjacent black modules merge into vertical bars. The legacy stacked-row
+# barcode (PDF417-style rows) is still parsed, so old barcode PDFs keep
+# decoding — but never written. All formats carry a 4-byte big-endian
+# length prefix so the parser knows where the payload ends and the padding
+# begins.
+#
+# Grids are RECTANGULAR (w x h): QR grids match the A4 landscape aspect
+# (~1.41421), bar-grids stretch it 4x (~5.65685). choose_grid_size steps h
+# by 2 from 32 with w = round(h * aspect). The reserved regions are the
+# three 8x8 finder blocks (192 cells), the timing row (w-16 cells) and
+# timing column (h-16 cells), and the centre logo tile (tileW x tileH
+# cells). The tile is square AS DRAWN (in points) for landscape grids:
+# tileW = max(8, halfUp(w * 595.28 / (4 * 841.89))),
+# tileH = max(8, halfUp(h / 4)) — so the logo fills a square tile in
+# both formats instead of a tall pillar in the bar-grid. Square grids
+# (w == h: the old format) keep the original rule, side =
+# max(8, min(w,h)//4), tileW = tileH = side, so old goldens stay
+# byte-identical. The three regions never overlap for w,h >= 32
+# (proven by test_capacity_formula_matches_independent_count), so the
+# capacity is pure arithmetic — no reserved-cell set is ever built.
 # ---------------------------------------------------------------------------
 
-GRID_MIN_SIZE = 32
-GRID_STEP = 4
 GRID_QUIET_MODULES = 4
 BARCODE_ROW_BYTES = 64
+BARCODE_ROW_BARS = 4 + 8 + BARCODE_ROW_BYTES * 8 + 4  # 528 bars per row
 BARCODE_BAR_PX = 2
 BARCODE_ROW_PX = 24
 BARCODE_GAP_PX = 4
 
 
-def _finder_cells(n: int) -> set[tuple[int, int]]:
-    """All cells reserved by the three 8x8 finder zones (7x7 + separator)."""
-    cells: set[tuple[int, int]] = set()
-    for r0, c0 in ((0, 0), (0, n - 8), (n - 8, 0)):
-        for r in range(r0, r0 + 8):
-            for c in range(c0, c0 + 8):
-                cells.add((r, c))
-    return cells
+def _half_up(x: float) -> int:
+    """Round-half-up: floor(x + 0.5). Python's round() is banker's
+    rounding and disagrees on exact .5 cases; Dart's double.round()
+    rounds half away from zero, i.e. half-up for non-negative x — so
+    this is the bit-for-bit match with the Dart side."""
+    return math.floor(x + 0.5)
 
 
-def _timing_cells(n: int) -> set[tuple[int, int]]:
-    cells: set[tuple[int, int]] = set()
-    for i in range(8, n - 8):
-        cells.add((6, i))
-        cells.add((i, 6))
-    return cells
+def _centre_tile(w: int, h: int) -> tuple[int, int, int, int]:
+    """(start_row, start_col, tile_w, tile_h) of the logo tile, centred.
+
+    SQUARE grids (w == h — the old format): the original rule, side =
+    max(8, n//4), tile_w = tile_h = side. Unchanged, so old goldens
+    stay byte-identical.
+
+    LANDSCAPE grids (w != h): the tile is square AS DRAWN (in points).
+    A module draws CODE_PAGE_WIDTH/w points wide and
+    CODE_PAGE_HEIGHT/h points tall, so a square-in-points tile needs
+    tileW/tileH = (h/w) * (CODE_PAGE_WIDTH/CODE_PAGE_HEIGHT); with the
+    tile height at a quarter of the grid height this gives
+    tileW = max(8, halfUp(w * 595.28 / (4 * 841.89))),
+    tileH = max(8, halfUp(h / 4)). Check: QR full frame 885x626 ->
+    156x157 (nearly unchanged); bar full frame 1742x308 -> 308x77
+    modules = 148.8x148.8 pt square as drawn."""
+    if w == h:
+        side = max(8, min(w, h) // 4)
+        return (h - side) // 2, (w - side) // 2, side, side
+    tile_w = max(8, _half_up(w * CODE_PAGE_HEIGHT / (BARCODE_STRETCH * CODE_PAGE_WIDTH)))
+    tile_h = max(8, _half_up(h / 4))
+    return (h - tile_h) // 2, (w - tile_w) // 2, tile_w, tile_h
 
 
-def _centre_tile(n: int) -> tuple[int, int, int]:
-    """(start_row, start_col, side) of the logo tile, centred, side = n//4."""
-    side = max(8, n // 4)
-    start = (n - side) // 2
-    return start, start, side
+def is_reserved(
+    r: int,
+    c: int,
+    w: int,
+    h: int,
+    centre_start_row: int,
+    centre_start_col: int,
+    centre_tile_w: int,
+    centre_tile_h: int,
+) -> bool:
+    """True when cell (r, c) of a w x h grid is reserved for a structural
+    pattern — a finder block, the timing row/column, or the centre logo
+    tile — and cannot carry a data bit.
+
+    All reserved regions are rectangles/lines, so membership is a few O(1)
+    range checks with zero allocation. The previous implementation built a
+    set of every reserved cell on every call and probed it per cell — the
+    Dart side measured that at ~100x slower than the arithmetic checks.
+    The centre tile is passed precomputed (see _centre_tile) so the
+    per-cell loop never recomputes it."""
+    # Three 8x8 finder blocks: top-left, top-right, bottom-left.
+    if r < 8 and c < 8:
+        return True
+    if r < 8 and c >= w - 8:
+        return True
+    if r >= h - 8 and c < 8:
+        return True
+    # Timing row 6 / column 6, between the finders.
+    if r == 6 and 8 <= c < w - 8:
+        return True
+    if c == 6 and 8 <= r < h - 8:
+        return True
+    # Centre logo tile.
+    return (
+        centre_start_row <= r < centre_start_row + centre_tile_h
+        and centre_start_col <= c < centre_start_col + centre_tile_w
+    )
 
 
-def _centre_cells(n: int) -> set[tuple[int, int]]:
-    r0, c0, side = _centre_tile(n)
-    return {(r, c) for r in range(r0, r0 + side) for c in range(c0, c0 + side)}
+def grid_capacity_bits(w: int, h: int) -> int:
+    """Placeable (non-reserved) cells of a w x h grid, in bits."""
+    _, _, tile_w, tile_h = _centre_tile(w, h)
+    return w * h - 192 - (w - 16) - (h - 16) - tile_w * tile_h
 
 
-def _reserved_cells(n: int) -> set[tuple[int, int]]:
-    return _finder_cells(n) | _timing_cells(n) | _centre_cells(n)
+def choose_grid_size(
+    payload_len: int, aspect: float = QR_ASPECT
+) -> tuple[int, int]:
+    """Smallest (w, h) with w/h ~= [aspect] whose data cells fit the
+    payload plus its 4-byte length prefix. h steps by 2 from 32;
+    w = round(h * aspect), at least 32.
 
-
-def grid_capacity_bits(n: int) -> int:
-    return n * n - len(_reserved_cells(n))
-
-
-def choose_grid_size(payload_len: int) -> int:
-    """Smallest grid (multiple of 4, >= 32) whose data cells fit the payload
-    plus its 4-byte length prefix."""
+    The rounding is int(h * aspect + 0.5) — round-half-up — to match
+    Dart's double.round() bit-for-bit; Python's round() is banker's
+    rounding and would disagree on an exact .5."""
     need_bits = (payload_len + 4) * 8
-    n = GRID_MIN_SIZE
-    while grid_capacity_bits(n) < need_bits:
-        n += GRID_STEP
-        if n > 4096:
+    h = GRID_MIN_HEIGHT
+    while True:
+        w = max(GRID_MIN_HEIGHT, int(h * aspect + 0.5))
+        if grid_capacity_bits(w, h) >= need_bits:
+            return w, h
+        h += GRID_HEIGHT_STEP
+        if h > GRID_MAX_HEIGHT:
             raise CodecError("payload too large for a single code grid")
-    return n
 
 
-def build_grid(payload: bytes) -> list[bytearray]:
-    """Render [payload] into an n x n module matrix (1 = black, 0 = white)."""
+def build_grid(payload: bytes, aspect: float = QR_ASPECT) -> list[bytearray]:
+    """Render [payload] into a w x h module matrix (1 = black, 0 = white),
+    w/h ~= [aspect] (QR_ASPECT by default). Bit order is unchanged:
+    row-major over the placeable cells, MSB first, with a 4-byte
+    big-endian length prefix."""
     blob = struct.pack(">I", len(payload)) + payload
-    n = choose_grid_size(len(payload))
-    grid: list[bytearray] = [bytearray(n) for _ in range(n)]
-    reserved = _reserved_cells(n)
+    w, h = choose_grid_size(len(payload), aspect)
+    grid: list[bytearray] = [bytearray(w) for _ in range(h)]
+    cs_r, cs_c, tile_w, tile_h = _centre_tile(w, h)
 
     # Finder patterns: 7x7, outer ring black, middle ring white, core 3x3 black.
-    for r0, c0 in ((0, 0), (0, n - 7), (n - 7, 0)):
+    for r0, c0 in ((0, 0), (0, w - 7), (h - 7, 0)):
         for dr in range(7):
             for dc in range(7):
                 on_ring = dr in (0, 6) or dc in (0, 6)
                 in_core = 2 <= dr <= 4 and 2 <= dc <= 4
                 grid[r0 + dr][c0 + dc] = 1 if (on_ring or in_core) else 0
     # Timing row/column 6, alternating black/white starting black.
-    for i in range(8, n - 8):
+    for i in range(8, w - 8):
         grid[6][i] = 1 if i % 2 == 0 else 0
+    for i in range(8, h - 8):
         grid[i][6] = 1 if i % 2 == 0 else 0
 
     # Data bits, row-major over the placeable cells, MSB first.
-    bit_iter = (bit for byte in blob for bit in [(byte >> k) & 1 for k in range(7, -1, -1)])
-    for r in range(n):
-        for c in range(n):
-            if (r, c) in reserved:
+    bit_index = 0
+    total_bits = len(blob) * 8
+    for r in range(h):
+        row = grid[r]
+        for c in range(w):
+            if is_reserved(r, c, w, h, cs_r, cs_c, tile_w, tile_h):
                 continue
-            try:
-                grid[r][c] = next(bit_iter)
-            except StopIteration:
+            if bit_index >= total_bits:
                 return grid
+            row[c] = (blob[bit_index >> 3] >> (7 - (bit_index & 7))) & 1
+            bit_index += 1
     return grid
 
 
+def build_barcode_grid(payload: bytes) -> list[bytearray]:
+    """Bar-grid barcode: the same grid layout as build_grid, but with the
+    4x-stretched aspect. Drawn into the full landscape page rect, the
+    non-uniform scale stretches each module into a tall thin rectangle,
+    so adjacent black modules merge into vertical bars. Parsing needs no
+    stretch knowledge — parse_grid reads the 1 px-per-module image."""
+    return build_grid(payload, BARCODE_ASPECT)
+
+
 def parse_grid(grid: list[bytearray]) -> bytes:
-    """Inverse of build_grid: read the length prefix, then the payload."""
-    n = len(grid)
-    reserved = _reserved_cells(n)
-    bits = [grid[r][c] for r in range(n) for c in range(n) if (r, c) not in reserved]
-    if len(bits) < 32:
+    """Inverse of build_grid: read the length prefix, then the payload.
+    Works for any w x h grid, including old square ones (w == h).
+
+    Streams the placeable bits row-major into bytes instead of building
+    a bit list: a full-frame grid holds ~525k bits."""
+    h = len(grid)
+    if h == 0:
+        raise CodecError("empty grid")
+    w = len(grid[0])
+    cs_r, cs_c, tile_w, tile_h = _centre_tile(w, h)
+    capacity = grid_capacity_bits(w, h)
+    if capacity < 32:
         raise CodecError("grid too small to hold a length prefix")
-    length = 0
-    for bit in bits[:32]:
-        length = (length << 1) | bit
-    if length * 8 + 32 > len(bits):
-        raise CodecError("grid length prefix exceeds grid capacity")
+    length: int | None = None
+    prefix = bytearray()
     out = bytearray()
-    for i in range(length):
-        byte = 0
-        for bit in bits[32 + i * 8 : 40 + i * 8]:
-            byte = (byte << 1) | bit
-        out.append(byte)
-    return bytes(out)
+    acc = 0
+    nbits = 0
+    for r in range(h):
+        row = grid[r]
+        for c in range(w):
+            if is_reserved(r, c, w, h, cs_r, cs_c, tile_w, tile_h):
+                continue
+            acc = (acc << 1) | (row[c] & 1)
+            nbits += 1
+            if nbits == 8:
+                if length is None:
+                    prefix.append(acc)
+                    if len(prefix) == 4:
+                        (length,) = struct.unpack(">I", bytes(prefix))
+                        if length * 8 + 32 > capacity:
+                            raise CodecError(
+                                "grid length prefix exceeds grid capacity"
+                            )
+                        if length == 0:
+                            return b""
+                else:
+                    out.append(acc)
+                    if len(out) == length:
+                        return bytes(out)
+                acc = 0
+                nbits = 0
+    if length is None:
+        raise CodecError("grid too small to hold a length prefix")
+    raise CodecError("grid ends before the payload does")
 
 
 def build_barcode_rows(payload: bytes) -> list[bytearray]:
     """Stacked-row barcode: each row is a bar strip carrying 64 payload bytes
     plus a 1-byte row index. Row layout (bars, 1 = black):
-    [4 start guard][8 row index][512 data][4 stop guard] = 528 bars."""
+    [4 start guard][8 row index][512 data][4 stop guard] = 528 bars.
+
+    LEGACY: new PDFs use the bar-grid (build_barcode_grid) instead. These
+    rows are only built by tests now; parse_barcode_rows stays so old
+    barcode PDFs keep decoding."""
     blob = struct.pack(">I", len(payload)) + payload
     rows: list[bytearray] = []
     for row_index in range(0, (len(blob) + BARCODE_ROW_BYTES - 1) // BARCODE_ROW_BYTES):
@@ -694,7 +1006,7 @@ def parse_barcode_rows(rows: list[bytearray]) -> bytes:
     if not rows:
         raise CodecError("no barcode rows")
     width = len(rows[0])
-    if width != 4 + 8 + BARCODE_ROW_BYTES * 8 + 4:
+    if width != BARCODE_ROW_BARS:
         raise CodecError(f"unexpected barcode row width {width}")
     chunks: dict[int, bytes] = {}
     ordered: list[bytes] = []
@@ -726,21 +1038,83 @@ def parse_barcode_rows(rows: list[bytearray]) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Image rendering / sampling (PIL) + PDF assembly (reportlab)
+# 1-bit image packing (mirrors lib/codec/png_encode.dart)
+# ---------------------------------------------------------------------------
+
+# bytes.translate tables: 0 <-> 1 (for 0/1 matrices), and bitwise NOT
+# (for packed pixel bytes — NOT the same operation).
+_FLIP_01_TABLE = bytes(1 if i == 0 else 0 if i == 1 else i for i in range(256))
+_BIT_INVERT_TABLE = bytes(255 - i for i in range(256))
+
+
+def pack_1bit(grid: list[bytearray]) -> bytes:
+    """Pack a w x h module matrix (1 = black) into predictor-1 packed bits
+    for a DeviceGray image XObject: MSB first, inverted (0 = black).
+    Pad bits past the row width are zero (they are the low bits of the
+    last byte, left as 0 by the shift)."""
+    h = len(grid)
+    w = len(grid[0]) if h else 0
+    stride = (w + 7) // 8
+    raw = bytearray(h * stride)
+    for y in range(h):
+        row = grid[y]
+        base = y * stride
+        current = 0
+        bits = 0
+        offset = base
+        for x in range(w):
+            # DeviceGray 1-bit: 0 = black — pack our 1 = black modules inverted.
+            current = (current << 1) | (row[x] ^ 1)
+            bits += 1
+            if bits == 8:
+                raw[offset] = current
+                offset += 1
+                current = 0
+                bits = 0
+        if bits:
+            raw[offset] = current << (8 - bits)
+    return bytes(raw)
+
+
+def deflate_1bit(grid: list[bytearray], invert: bool = False) -> bytes:
+    """zlib-compress packed 1-bit pixels for a PDF image XObject
+    (predictor 1: packed bits, no filter bytes). Level 6, like Dart: on
+    random grid data level 9 buys nothing, and on repetitive data level 6
+    is far faster. [invert] flips every pixel for dark-theme pages (pad
+    bits are re-zeroed after the flip)."""
+    packed = bytearray(pack_1bit(grid))
+    if invert:
+        packed = bytearray(bytes(packed).translate(_BIT_INVERT_TABLE))
+        # The flip sets the pad bits to 1; put them back to 0.
+        w = len(grid[0])
+        stride = (w + 7) // 8
+        pad_bits = stride * 8 - w
+        if pad_bits:
+            mask = (0xFF << pad_bits) & 0xFF
+            for y in range(len(grid)):
+                packed[y * stride + stride - 1] &= mask
+    return zlib.compress(bytes(packed), 6)
+
+
+# ---------------------------------------------------------------------------
+# Image rendering / sampling (PIL — used by the image round-trip tests only;
+# the PDF path embeds packed bits directly and needs no imaging library)
 # ---------------------------------------------------------------------------
 
 
-def render_grid_image(grid: list[bytearray], module_px: int = 4):
+def render_grid_image(grid: list[bytearray], module_px: int = 4,
+                      quiet: int = GRID_QUIET_MODULES):
     """Render a module matrix to a 1-bit PIL image with a quiet zone."""
     from PIL import Image
 
-    n = len(grid)
-    quiet = GRID_QUIET_MODULES
-    size = (n + 2 * quiet) * module_px
-    img = Image.new("1", (size, size), 1)
+    h = len(grid)
+    w = len(grid[0])
+    width = (w + 2 * quiet) * module_px
+    height = (h + 2 * quiet) * module_px
+    img = Image.new("1", (width, height), 1)
     px = img.load()
-    for r in range(n):
-        for c in range(n):
+    for r in range(h):
+        for c in range(w):
             if grid[r][c]:
                 x0 = (c + quiet) * module_px
                 y0 = (r + quiet) * module_px
@@ -750,18 +1124,19 @@ def render_grid_image(grid: list[bytearray], module_px: int = 4):
     return img
 
 
-def sample_grid_image(img, module_px: int = 4) -> list[bytearray]:
+def sample_grid_image(img, module_px: int = 4,
+                      quiet: int = GRID_QUIET_MODULES) -> list[bytearray]:
     """Sample a rendered grid image back to a module matrix (module centres)."""
-    quiet = GRID_QUIET_MODULES
-    n = img.width // module_px - 2 * quiet
-    if n <= 0 or img.width != img.height:
-        raise CodecError("not a square grid image")
+    w = img.width // module_px - 2 * quiet
+    h = img.height // module_px - 2 * quiet
+    if w <= 0 or h <= 0:
+        raise CodecError("grid image too small")
     grey = img.convert("L")
     px = grey.load()
     grid: list[bytearray] = []
-    for r in range(n):
-        row = bytearray(n)
-        for c in range(n):
+    for r in range(h):
+        row = bytearray(w)
+        for c in range(w):
             x = (c + quiet) * module_px + module_px // 2
             y = (r + quiet) * module_px + module_px // 2
             row[c] = 1 if px[x, y] < 128 else 0
@@ -770,7 +1145,7 @@ def sample_grid_image(img, module_px: int = 4) -> list[bytearray]:
 
 
 def render_barcode_image(rows: list[bytearray]):
-    """Render barcode rows to a 1-bit PIL image."""
+    """Render legacy stacked barcode rows to a 1-bit PIL image."""
     from PIL import Image
 
     width = len(rows[0]) * BARCODE_BAR_PX
@@ -789,7 +1164,7 @@ def render_barcode_image(rows: list[bytearray]):
 
 
 def sample_barcode_image(img) -> list[bytearray]:
-    """Sample a rendered barcode image back to bar rows."""
+    """Sample a rendered legacy barcode image back to bar rows."""
     n_rows = round(img.height / (BARCODE_ROW_PX + BARCODE_GAP_PX))
     n_bars = img.width // BARCODE_BAR_PX
     grey = img.convert("L")
@@ -805,9 +1180,286 @@ def sample_barcode_image(img) -> list[bytearray]:
     return rows
 
 
-def detect_code_kind(img) -> str:
-    """'grid' for a square code image, 'barcode' for a wide strip."""
-    return "grid" if abs(img.width - img.height) <= max(img.width, img.height) // 10 else "barcode"
+# ---------------------------------------------------------------------------
+# Minimal PDF writer (mirrors lib/codec/pdf_writer.dart)
+#
+# Hand-rolled: the 1-bit code images are embedded verbatim as DeviceGray
+# image XObjects — no PIL/reportlab re-encode step ever runs on them.
+# (The old reportlab path decoded each 1-bit PNG to RGB and re-deflated
+# it; the Dart side measured ~194 ms per frame inside doc.save() for that,
+# vs ~1 ms to serialise a page here.)
+#
+# Document shape (fixed): Catalog, Pages, Helvetica + Helvetica-Bold
+# (standard-14 fonts, never embedded), one shared RGB logo XObject (when
+# the document has frame pages), then per page: Page, Flate content
+# stream, code image XObject.
+# The image dicts deliberately contain NO nested dictionary: the extractor
+# finds an image dict by scanning back to the nearest `<<` before `stream`,
+# so a nested DecodeParms dict would be found instead of the outer dict.
+# The image streams are therefore predictor 1 (packed bits, no filter
+# bytes, no DecodeParms).
+# ---------------------------------------------------------------------------
+
+# Common punctuation mapped to its WinAnsi (cp1252) byte, so file names
+# and the cover manifest keep their dashes and quotes instead of degrading
+# to '?'. Mirrors _winAnsiPunctuation in pdf_writer.dart.
+_WIN_ANSI_PUNCTUATION = {
+    0x20AC: 0x80, 0x201A: 0x82, 0x0192: 0x83, 0x201E: 0x84, 0x2026: 0x85,
+    0x2020: 0x86, 0x2021: 0x87, 0x02C6: 0x88, 0x2030: 0x89, 0x0160: 0x8A,
+    0x2039: 0x8B, 0x0152: 0x8C, 0x017D: 0x8E, 0x2018: 0x91, 0x2019: 0x92,
+    0x201C: 0x93, 0x201D: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97,
+    0x02DC: 0x98, 0x2122: 0x99, 0x0161: 0x9A, 0x203A: 0x9B, 0x0153: 0x9C,
+    0x017E: 0x9E, 0x0178: 0x9F,
+}
+
+
+def _pdf_escape(s: str) -> str:
+    """PDF literal-string escaping: backslash, parens; chars outside
+    printable ASCII / WinAnsi 160-255 become '?' unless they have a
+    WinAnsi mapping above. The em-dash in the cover manifest (U+2014)
+    maps to WinAnsi 0x97."""
+    out = []
+    for ch in s:
+        code = ord(ch)
+        if code in (0x28, 0x29, 0x5C):
+            out.append("\\")
+            out.append(ch)
+        elif (32 <= code <= 126) or (160 <= code <= 255):
+            out.append(ch)
+        elif code in _WIN_ANSI_PUNCTUATION:
+            out.append(chr(_WIN_ANSI_PUNCTUATION[code]))
+        else:
+            out.append("?")
+    return "".join(out)
+
+
+def _pdf_num(v: float) -> str:
+    """A PDF number: 2 decimals, trailing zeros (and a trailing dot) cut."""
+    s = f"{v:.2f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+
+def _latin1_bytes(s: str) -> bytes:
+    return bytes(ord(c) if ord(c) <= 255 else 0x3F for c in s)
+
+
+def _text_op(s: str, size: float, x: float, y: float, bold: bool = False) -> str:
+    font = "F2" if bold else "F1"
+    return (
+        f"BT /{font} {_pdf_num(size)} Tf "
+        f"{_pdf_num(x)} {_pdf_num(y)} Td ({_pdf_escape(s)}) Tj ET\n"
+    )
+
+
+def _image_op(name: str, w: float, h: float, x: float, y: float) -> str:
+    return (
+        f"q {_pdf_num(w)} 0 0 {_pdf_num(h)} "
+        f"{_pdf_num(x)} {_pdf_num(y)} cm /{name} Do Q\n"
+    )
+
+
+@dataclass
+class _PdfPageSpec:
+    is_cover: bool
+    manifest_lines: list[str] = field(default_factory=list)
+    image_width: int = 0
+    image_height: int = 0
+    image_deflate: bytes = b""
+    logo_rect: tuple[float, float, float, float] | None = None  # x, y, w, h
+    dark: bool = False
+
+
+def _page_content(page: _PdfPageSpec) -> bytes:
+    """The page's content-stream operators (uncompressed)."""
+    ops: list[str] = []
+    if page.is_cover:
+        # Unchanged cover layout (same text, sizes and margins as the old
+        # reportlab cover): title, subtitle, manifest lines, portrait A4.
+        mm = 72 / 25.4
+        width, height = COVER_PAGE_WIDTH, COVER_PAGE_HEIGHT
+        ops.append(_text_op("MIDDLE OUT", 34, 20 * mm, height - 30 * mm, bold=True))
+        ops.append(_text_op("Lossless file, printed as code.", 12, 20 * mm, height - 42 * mm))
+        y = height - 60 * mm
+        for line in page.manifest_lines:
+            ops.append(_text_op(line, 11, 20 * mm, y))
+            y -= 7 * mm
+    else:
+        # Full-bleed code page: the image spans the ENTIRE landscape rect
+        # — no margins, no caption, no quiet zone. Dark pages paint the
+        # background black first (the code pixels are inverted too).
+        if page.dark:
+            ops.append(
+                f"0 g 0 0 {_pdf_num(CODE_PAGE_WIDTH)} "
+                f"{_pdf_num(CODE_PAGE_HEIGHT)} re f\n"
+            )
+        ops.append(_image_op("Im0", CODE_PAGE_WIDTH, CODE_PAGE_HEIGHT, 0, 0))
+        if page.logo_rect is not None:
+            x, y, w, _h = page.logo_rect
+            ops.append(_logo_op(x, y, w))
+    return _latin1_bytes("".join(ops))
+
+
+class RawPdfWriter:
+    """Minimal PDF writer: 1 portrait cover page + 1 landscape full-bleed
+    code page per frame, each frame embedded as a 1-bit DeviceGray image
+    XObject plus the RGB logo tile over its centre."""
+
+    def __init__(self) -> None:
+        self._pages: list[_PdfPageSpec] = []
+
+    def add_cover_page(self, manifest_lines: list[str]) -> None:
+        self._pages.append(
+            _PdfPageSpec(is_cover=True, manifest_lines=list(manifest_lines))
+        )
+
+    def add_frame_page(
+        self,
+        image_width: int,
+        image_height: int,
+        image_deflate: bytes,
+        logo_rect: tuple[float, float, float, float],
+        dark: bool = False,
+    ) -> None:
+        self._pages.append(
+            _PdfPageSpec(
+                is_cover=False,
+                image_width=image_width,
+                image_height=image_height,
+                image_deflate=image_deflate,
+                logo_rect=logo_rect,
+                dark=dark,
+            )
+        )
+
+    @property
+    def page_count(self) -> int:
+        return len(self._pages)
+
+    def build(self) -> bytes:
+        # Object numbering: 1 Catalog, 2 Pages, 3 Helvetica, 4 Helvetica-Bold,
+        # 5 the shared RGB logo XObject (only when the document has frame
+        # pages), then per page: Page, Contents, and (frame pages only)
+        # the code image XObject.
+        n = len(self._pages)
+        has_logo = any(not page.is_cover for page in self._pages)
+        logo_obj = 5 if has_logo else 0
+        page_obj: list[int] = []
+        content_obj: list[int] = []
+        image_obj: list[int] = []  # 0 on the cover (no image)
+        nxt = 6 if has_logo else 5
+        for page in self._pages:
+            page_obj.append(nxt)
+            nxt += 1
+            content_obj.append(nxt)
+            nxt += 1
+            if page.is_cover:
+                image_obj.append(0)
+            else:
+                image_obj.append(nxt)
+                nxt += 1
+
+        out = bytearray()
+        offsets: list[int] = []
+
+        def add_object(body: bytes) -> None:
+            offsets.append(len(out))
+            out.extend(f"{len(offsets)} 0 obj\n".encode("ascii"))
+            out.extend(body)
+            out.extend(b"\nendobj\n")
+
+        out.extend(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+        kids = " ".join(f"{o} 0 R" for o in page_obj)
+        add_object(f"<< /Type /Catalog /Pages 2 0 R >>".encode("ascii"))
+        add_object(
+            f"<< /Type /Pages /Kids [{kids}] /Count {n} >>".encode("ascii")
+        )
+        add_object(
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+            b"/Encoding /WinAnsiEncoding >>"
+        )
+        add_object(
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold "
+            b"/Encoding /WinAnsiEncoding >>"
+        )
+        if has_logo:
+            # One shared logo XObject, referenced by every frame page.
+            add_object(
+                (
+                    f"<< /Type /XObject /Subtype /Image "
+                    f"/Width {LOGO_SIZE} /Height {LOGO_SIZE} "
+                    f"/BitsPerComponent 8 /ColorSpace /DeviceRGB "
+                    f"/Filter /FlateDecode "
+                    f"/Length {len(LOGO_DEFLATE)} >>\n"
+                ).encode("ascii")
+                + b"stream\n"
+                + LOGO_DEFLATE
+                + b"\nendstream"
+            )
+        for i, page in enumerate(self._pages):
+            if page.is_cover:
+                mediabox = (
+                    f"[0 0 {_pdf_num(COVER_PAGE_WIDTH)} "
+                    f"{_pdf_num(COVER_PAGE_HEIGHT)}]"
+                )
+                xobjects = ""
+            else:
+                mediabox = (
+                    f"[0 0 {_pdf_num(CODE_PAGE_WIDTH)} "
+                    f"{_pdf_num(CODE_PAGE_HEIGHT)}]"
+                )
+                xobjects = (
+                    f" /XObject << /Im0 {image_obj[i]} 0 R "
+                    f"/Im1 {logo_obj} 0 R >>"
+                )
+            add_object(
+                (
+                    f"<< /Type /Page /Parent 2 0 R /MediaBox {mediabox} "
+                    f"/Resources << /Font << /F1 3 0 R /F2 4 0 R >>"
+                    f"{xobjects} "
+                    f"/ProcSet [/PDF /Text /ImageB /ImageC] >> "
+                    f"/Contents {content_obj[i]} 0 R >>"
+                ).encode("ascii")
+            )
+            compressed = zlib.compress(_page_content(page), 6)
+            add_object(
+                f"<< /Length {len(compressed)} /Filter /FlateDecode >>\n".encode("ascii")
+                + b"stream\n"
+                + compressed
+                + b"\nendstream"
+            )
+            if page.is_cover:
+                continue
+            add_object(
+                (
+                    f"<< /Type /XObject /Subtype /Image "
+                    f"/Width {page.image_width} /Height {page.image_height} "
+                    f"/BitsPerComponent 1 /ColorSpace /DeviceGray "
+                    f"/Filter /FlateDecode "
+                    f"/Length {len(page.image_deflate)} >>\n"
+                ).encode("ascii")
+                + b"stream\n"
+                + page.image_deflate
+                + b"\nendstream"
+            )
+
+        xref_at = len(out)
+        total = len(offsets) + 1
+        xref = ["xref", f"0 {total}", "0000000000 65535 f "]
+        for off in offsets:
+            xref.append(f"{off:010d} 00000 n ")
+        xref.extend(
+            [
+                "trailer",
+                f"<< /Size {total} /Root 1 0 R >>",
+                "startxref",
+                str(xref_at),
+                "%%EOF",
+            ]
+        )
+        out.extend(("\n".join(xref) + "\n").encode("ascii"))
+        return bytes(out)
 
 
 @dataclass
@@ -817,29 +1469,80 @@ class PdfStats:
     frames: int
 
 
+def logo_rect_for_grid(w: int, h: int) -> tuple[float, float, float, float]:
+    """Logo overlay rect (x, y, width, height) in points on a landscape
+    code page. The logo is drawn SQUARE — side = min(tileW, tileH),
+    centred in the centre-tile rect — so it is never stretched. With
+    the square-as-drawn tile rule the tile is (nearly) square in
+    points for both formats, so the logo fills the tile: for the QR
+    grid the tile is 156x157 modules and the logo fills it exactly,
+    and for the bar-grid the tile is 308x77 modules = 148.8x148.8 pt
+    and the logo fills it too. Drawing the logo wider than the
+    reserved tile would cover live data modules. PDF Y is bottom-up
+    while grid rows are top-down."""
+    start_row, start_col, tile_w, tile_h = _centre_tile(w, h)
+    tile_w_pt = tile_w / w * CODE_PAGE_WIDTH
+    tile_h_pt = tile_h / h * CODE_PAGE_HEIGHT
+    logo_side = min(tile_w_pt, tile_h_pt)
+    x = start_col / w * CODE_PAGE_WIDTH + (tile_w_pt - logo_side) / 2
+    tile_bottom = CODE_PAGE_HEIGHT - (start_row + tile_h) / h * CODE_PAGE_HEIGHT
+    y = tile_bottom + (tile_h_pt - logo_side) / 2
+    return (x, y, logo_side, logo_side)
+
+
+def _logo_op(x: float, y: float, side: float) -> str:
+    """The logo tile, drawn with a rounded-rectangle clip (bezier
+    corners, kappa = 0.5523, radius 0.2 * side) so the tile keeps its
+    rounded corners. Mirrors _logoOp in pdf_writer.dart."""
+    r = side * 0.2
+    k = 0.5522847498
+    n = _pdf_num
+    ops = ["q "]
+    ops.append(f"{n(x + r)} {n(y)} m ")
+    ops.append(f"{n(x + side - r)} {n(y)} l ")
+    ops.append(
+        f"{n(x + side - r + k * r)} {n(y)} "
+        f"{n(x + side)} {n(y + r - k * r)} "
+        f"{n(x + side)} {n(y + r)} c "
+    )
+    ops.append(f"{n(x + side)} {n(y + side - r)} l ")
+    ops.append(
+        f"{n(x + side)} {n(y + side - r + k * r)} "
+        f"{n(x + side - r + k * r)} {n(y + side)} "
+        f"{n(x + side - r)} {n(y + side)} c "
+    )
+    ops.append(f"{n(x + r)} {n(y + side)} l ")
+    ops.append(
+        f"{n(x + r - k * r)} {n(y + side)} "
+        f"{n(x)} {n(y + side - r + k * r)} "
+        f"{n(x)} {n(y + side - r)} c "
+    )
+    ops.append(f"{n(x)} {n(y + r)} l ")
+    ops.append(
+        f"{n(x)} {n(y + r - k * r)} "
+        f"{n(x + r - k * r)} {n(y)} "
+        f"{n(x + r)} {n(y)} c "
+    )
+    ops.append("h W n\n")
+    ops.append(f"{n(side)} 0 0 {n(side)} {n(x)} {n(y)} cm /Im1 Do Q\n")
+    return "".join(ops)
+
+
 def build_pdf(
     result: EncodeResult,
     file_name: str,
     out_path: str,
-    module_px: int = 3,
+    dark: bool = False,
 ) -> PdfStats:
-    """Assemble the encoded PDF: 1 cover page + 1 full-page code page per
-    frame. Returns page count and file size (the 5-20 MB-per-GB band is
-    checked by the caller against the original size)."""
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import mm
-    from reportlab.pdfgen import canvas
-
-    width, height = A4
+    """Assemble the encoded PDF: 1 portrait cover page + 1 landscape
+    full-bleed code page per frame. [dark] inverts the code pixels and
+    paints each code page's background black. Returns page count and file
+    size (the 5-20 MB-per-GB band is checked by the caller against the
+    original size)."""
     stats = result.stats
-    pdf = canvas.Canvas(out_path, pagesize=A4)
+    writer = RawPdfWriter()
 
-    # --- Cover page ---
-    pdf.setFont("Helvetica-Bold", 34)
-    pdf.drawString(20 * mm, height - 30 * mm, "MIDDLE OUT")
-    pdf.setFont("Helvetica", 12)
-    pdf.drawString(20 * mm, height - 42 * mm, "Lossless file, printed as code.")
-    pdf.setFont("Helvetica", 11)
+    # --- Cover page (unchanged: portrait, manifest text) ---
     lines = [
         f"File: {file_name}",
         f"Original size: {stats.original_size:,} bytes",
@@ -851,82 +1554,445 @@ def build_pdf(
         f"Format: {'Barcode' if result.barcode else 'QR-style grid'}",
         "Decode with the Middle Out app — scan the frames in order.",
     ]
-    y = height - 60 * mm
-    for line in lines:
-        pdf.drawString(20 * mm, y, line)
-        y -= 7 * mm
-    pdf.showPage()
+    writer.add_cover_page(lines)
 
-    # --- One full-page code page per frame ---
+    # --- One landscape full-bleed code page per frame ---
     for frame in result.frames:
         raw = frame.to_bytes()
-        if result.barcode:
-            img = render_barcode_image(build_barcode_rows(raw))
-        else:
-            img = render_grid_image(build_grid(raw), module_px=module_px)
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        buf.seek(0)
-        max_w, max_h = width - 20 * mm, height - 30 * mm
-        scale = min(max_w / img.width, max_h / img.height)
-        iw, ih = img.width * scale, img.height * scale
-        from reportlab.lib.utils import ImageReader
-
-        pdf.drawImage(
-            ImageReader(buf), (width - iw) / 2, (height - ih) / 2 + 5 * mm,
-            width=iw, height=ih, preserveAspectRatio=True,
+        grid = build_barcode_grid(raw) if result.barcode else build_grid(raw)
+        h = len(grid)
+        w = len(grid[0])
+        writer.add_frame_page(
+            image_width=w,
+            image_height=h,
+            image_deflate=deflate_1bit(grid, invert=dark),
+            logo_rect=logo_rect_for_grid(w, h),
+            dark=dark,
         )
-        kind = "DATA" if frame.is_data else "PARITY"
-        pdf.setFont("Helvetica", 10)
-        pdf.drawCentredString(
-            width / 2, 12 * mm,
-            f"Frame {frame.frame_index + 1} of {stats.frame_count}  ·  "
-            f"{kind}  ·  Group {frame.group_index + 1}  ·  "
-            f"{len(frame.payload):,} bytes",
-        )
-        pdf.showPage()
-    pdf.save()
+    pdf_bytes = writer.build()
+    with open(out_path, "wb") as fh:
+        fh.write(pdf_bytes)
 
     return PdfStats(
         pages=1 + len(result.frames),
-        size_bytes=os.path.getsize(out_path),
+        size_bytes=len(pdf_bytes),
         frames=len(result.frames),
     )
 
 
-def extract_pdf_images(pdf_path: str, out_dir: str) -> list[str]:
-    """Extract embedded images from a PDF with poppler's pdfimages.
-    Returns paths in page order. (Used by the CLI decode path and tests.)"""
-    prefix = os.path.join(out_dir, "frame")
-    proc = subprocess.run(
-        ["pdfimages", "-png", pdf_path, prefix],
-        capture_output=True, text=True, check=False,
-    )
-    if proc.returncode != 0:
-        raise CodecError(f"pdfimages failed: {proc.stderr.strip()}")
-    return sorted(
-        os.path.join(out_dir, f)
-        for f in os.listdir(out_dir)
-        if f.startswith("frame-") and f.endswith(".png")
-    )
+# ---------------------------------------------------------------------------
+# PDF frame extraction (mirrors lib/services/pdf_frame_extractor.dart)
+#
+# The encoder embeds each frame as a 1-bit image XObject; this reader finds
+# those XObjects, inflates the FlateDecode streams, and parses the code
+# images back to frame blobs — which then feed the normal decode().
+#
+# The reader is deliberately tolerant: it tries 1-bit and 8-bit greyscale
+# (and RGB) images and PNG/TIFF predictors, because the PDF writer's exact
+# image encoding is an implementation detail — the golden old-format
+# fixtures are 8-bit RGB XObjects from the pre-RawPdfWriter builder.
+# Anything it cannot parse is skipped, never guessed: a blob is only
+# returned when it parses as a valid frame, so the cover manifest grid
+# and alpha masks fall away harmlessly. When a 1-bit image exists the
+# RGB logo tile is never attempted at all (the 1-bit images are the
+# codes); only when no 1-bit image exists (old-format PDFs) is every
+# image attempted.
+#
+# Format branching is by image aspect, in order: a 528-bar-wide stacked
+# geometry means a legacy stacked-row barcode; w/h ~= 5.66 a bar-grid;
+# w/h ~= 1.41 a rectangular QR grid; square an old grid (quiet zone 4,
+# falling back to 0). Polarity is auto-detected per page from the
+# top-left finder (guard bars for stacked barcodes): dark-theme pages
+# have every pixel inverted.
+# ---------------------------------------------------------------------------
 
 
-def decode_pdf(pdf_path: str, passphrase: str | None = None, module_px: int = 3) -> bytes:
-    """Full loop: PDF -> frame images -> frames -> original bytes."""
-    from PIL import Image
+@dataclass
+class PdfExtraction:
+    frames: list[bytes]
+    images_found: int
+    images_parsed: int
 
-    with tempfile.TemporaryDirectory() as tmp:
-        images = extract_pdf_images(pdf_path, tmp)
-        if not images:
-            raise CodecError("no code images found in PDF")
-        blobs: list[bytes] = []
-        for path in images:
-            img = Image.open(path)
-            if detect_code_kind(img) == "grid":
-                blobs.append(parse_grid(sample_grid_image(img, module_px)))
+
+@dataclass
+class _PdfImage:
+    width: int
+    height: int
+    bits_per_component: int
+    colors: int
+    predictor: int
+    stream: bytes
+    flate: bool
+
+
+def _dict_int(dict_text: str, key: str) -> int | None:
+    match = re.search(re.escape(key) + r"\s+(\d+)", dict_text)
+    return int(match.group(1)) if match else None
+
+
+def _find_images(pdf: bytes) -> list[_PdfImage]:
+    """One entry per image XObject: dictionary fields + raw stream bytes."""
+    images: list[_PdfImage] = []
+    search_from = 0
+    while True:
+        stream_at = pdf.find(b"stream", search_from)
+        if stream_at < 0:
+            break
+        # A real stream keyword follows its dictionary's closing ">>"
+        # (plus optional EOL) — this skips the "stream" inside "endstream".
+        back = stream_at
+        while back > 0 and pdf[back - 1] in (0x0A, 0x0D, 0x20, 0x09):
+            back -= 1
+        if pdf[back - 2 : back] != b">>":
+            search_from = stream_at + 6
+            continue
+        # Stream data starts after "stream" + EOL (\r\n or \n).
+        data_start = stream_at + 6
+        if data_start < len(pdf) and pdf[data_start] == 0x0D:
+            data_start += 1
+        if data_start < len(pdf) and pdf[data_start] == 0x0A:
+            data_start += 1
+        # The dictionary sits just before "stream" — look back for "<<".
+        dict_start = pdf.rfind(b"<<", 0, stream_at)
+        search_from = data_start
+        if dict_start < 0 or stream_at - dict_start > 4096:
+            continue
+        dict_text = pdf[dict_start:stream_at].decode("latin-1", errors="ignore")
+        if "/Subtype" not in dict_text or "/Image" not in dict_text:
+            continue
+        length = _dict_int(dict_text, "/Length")
+        if length is not None and data_start + length <= len(pdf):
+            stream = pdf[data_start : data_start + length]
+        else:
+            end_at = pdf.find(b"endstream", data_start)
+            if end_at < 0:
+                continue
+            end = end_at
+            while end > data_start and pdf[end - 1] in (0x0A, 0x0D):
+                end -= 1
+            stream = pdf[data_start:end]
+        width = _dict_int(dict_text, "/Width")
+        height = _dict_int(dict_text, "/Height")
+        if width is None or height is None:
+            continue
+        bpc = _dict_int(dict_text, "/BitsPerComponent") or 1
+        colors = 3 if "/DeviceRGB" in dict_text else 1
+        predictor = _dict_int(dict_text, "/Predictor") or 1
+        images.append(
+            _PdfImage(
+                width=width,
+                height=height,
+                bits_per_component=bpc,
+                colors=colors,
+                predictor=predictor,
+                stream=stream,
+                flate="/FlateDecode" in dict_text,
+            )
+        )
+    return images
+
+
+def _paeth(a: int, b: int, c: int) -> int:
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+
+def _unpredict(raw: bytes, row_bytes: int, image: _PdfImage) -> list[bytes] | None:
+    """Undo a FlateDecode predictor, returning one byte-row per image row."""
+    predictor = image.predictor
+    height = image.height
+    if predictor == 1:
+        if len(raw) < row_bytes * height:
+            return None
+        return [raw[y * row_bytes : (y + 1) * row_bytes] for y in range(height)]
+    if predictor == 2:
+        # TIFF predictor: each sample differs from the one to its left.
+        if len(raw) < row_bytes * height:
+            return None
+        bpp = max(1, min((image.bits_per_component * image.colors + 7) // 8, row_bytes))
+        rows: list[bytes] = []
+        for y in range(height):
+            row = bytearray(raw[y * row_bytes : (y + 1) * row_bytes])
+            for i in range(bpp, row_bytes):
+                row[i] = (row[i] + row[i - bpp]) & 0xFF
+            rows.append(bytes(row))
+        return rows
+    if 10 <= predictor <= 15:
+        # PNG predictors: one filter byte per row.
+        stride = row_bytes + 1
+        if len(raw) < stride * height:
+            return None
+        bpp = max(1, min((image.bits_per_component * image.colors + 7) // 8, row_bytes))
+        rows = []
+        previous = bytes(row_bytes)
+        for y in range(height):
+            filter_type = raw[y * stride]
+            row = bytearray(raw[y * stride + 1 : (y + 1) * stride])
+            for i in range(row_bytes):
+                a = row[i - bpp] if i >= bpp else 0
+                b = previous[i]
+                c = previous[i - bpp] if i >= bpp else 0
+                if filter_type == 1:
+                    predict = a
+                elif filter_type == 2:
+                    predict = b
+                elif filter_type == 3:
+                    predict = (a + b) // 2
+                elif filter_type == 4:
+                    predict = _paeth(a, b, c)
+                else:
+                    predict = 0
+                row[i] = (row[i] + predict) & 0xFF
+            rows.append(bytes(row))
+            previous = bytes(row)
+        return rows
+    return None
+
+
+# Stored DeviceGray byte -> 8 matrix values (1 = black): a stored 0 bit
+# is black, so the expansion inverts each bit.
+_BIT_EXPAND = [
+    bytes(1 - ((v >> (7 - k)) & 1) for k in range(8)) for v in range(256)
+]
+# 8-bit sample -> matrix value (1 = black below the midpoint).
+_THRESHOLD_TABLE = bytes(1 if i < 128 else 0 for i in range(256))
+
+
+def _decode_image(image: _PdfImage) -> list[bytearray] | None:
+    """Inflate and unpack one image XObject into a 0/1 pixel matrix
+    (1 = black module), or None when the image cannot be decoded."""
+    if not image.flate:
+        return None
+    try:
+        raw = zlib.decompress(image.stream)
+    except zlib.error:
+        return None
+    row_bytes = (image.width * image.bits_per_component * image.colors + 7) // 8
+    rows = _unpredict(raw, row_bytes, image)
+    if rows is None:
+        return None
+    matrix: list[bytearray] = []
+    if image.bits_per_component == 1 and image.colors == 1:
+        for y in range(image.height):
+            expanded = b"".join(_BIT_EXPAND[b] for b in rows[y])
+            matrix.append(bytearray(expanded[: image.width]))
+    elif image.bits_per_component == 8:
+        for y in range(image.height):
+            row = rows[y]
+            if image.colors == 1:
+                matrix.append(bytearray(row.translate(_THRESHOLD_TABLE)))
             else:
-                blobs.append(parse_barcode_rows(sample_barcode_image(img)))
-    return decode(blobs, passphrase)
+                matrix.append(
+                    bytearray(
+                        1 if (r + g + b) < 384 else 0
+                        for r, g, b in zip(row[0::3], row[1::3], row[2::3])
+                    )
+                )
+    else:
+        return None
+    return matrix
+
+
+def _finder_bit(r: int, c: int) -> int:
+    """Expected light-theme value of top-left finder cell (r, c), 0..6."""
+    on_ring = r in (0, 6) or c in (0, 6)
+    in_core = 2 <= r <= 4 and 2 <= c <= 4
+    return 1 if (on_ring or in_core) else 0
+
+
+def grid_is_dark(grid: list[bytearray]) -> bool:
+    """Polarity auto-detect: compare the top-left 7x7 finder against the
+    expected light pattern; True when the inverted pattern matches
+    better (a dark-theme page). A real finder matches 49/49 one way and
+    0/49 the other, so the halfway threshold has a wide margin."""
+    matches_light = 0
+    for r in range(7):
+        row = grid[r]
+        for c in range(7):
+            if row[c] == _finder_bit(r, c):
+                matches_light += 1
+    return matches_light < 25
+
+
+def _invert_matrix(matrix: list[bytearray]) -> list[bytearray]:
+    return [bytearray(bytes(row).translate(_FLIP_01_TABLE)) for row in matrix]
+
+
+def _is_frame(blob: bytes) -> bool:
+    """True when [blob] parses as a Middle Out frame (magic + header CRC).
+    The cover manifest grid parses to text and fails here, so it is
+    skipped rather than treated as a frame."""
+    # Pre-filter on the SMALLEST header (v1, 97 bytes): a v1 frame with
+    # an empty payload is only 101 bytes, and the real validation happens
+    # in Frame.from_bytes below.
+    if len(blob) < HEADER_SIZE_V1 + 4:
+        return False
+    if blob[:4] != MAGIC:
+        return False
+    try:
+        Frame.from_bytes(blob)
+    except CorruptFrameError:
+        return False
+    return True
+
+
+def _parse_grid_blob(grid: list[bytearray]) -> bytes | None:
+    try:
+        blob = parse_grid(grid)
+    except CodecError:
+        return None
+    return blob if _is_frame(blob) else None
+
+
+def _parse_barcode_blob(rows: list[bytearray]) -> bytes | None:
+    try:
+        blob = parse_barcode_rows(rows)
+    except CodecError:
+        return None
+    return blob if _is_frame(blob) else None
+
+
+def _try_parse_grid_matrix(grid: list[bytearray]) -> bytes | None:
+    """Polarity-detect (finder) then parse; falls back to the opposite
+    polarity. Returns the blob only when it is a valid frame."""
+    if len(grid) < 7 or len(grid[0]) < 7:
+        return None
+    inverted = _invert_matrix(grid)
+    candidates = (inverted, grid) if grid_is_dark(grid) else (grid, inverted)
+    for candidate in candidates:
+        blob = _parse_grid_blob(candidate)
+        if blob is not None:
+            return blob
+    return None
+
+
+def _try_parse_barcode_matrix(
+    matrix: list[bytearray], bar_px: int, row_count: int
+) -> bytes | None:
+    """Sample stacked barcode rows out of a pixel matrix and parse them.
+    Polarity comes from the guard bars (black on a light page), with the
+    opposite polarity as a fallback."""
+    row_stride = BARCODE_ROW_PX + BARCODE_GAP_PX
+    rows: list[bytearray] = []
+    for r in range(row_count):
+        y = r * row_stride + BARCODE_ROW_PX // 2
+        src = matrix[y]
+        row = bytearray(BARCODE_ROW_BARS)
+        for b in range(BARCODE_ROW_BARS):
+            row[b] = src[b * bar_px + bar_px // 2]
+        rows.append(row)
+    dark = list(rows[0][:4]) == [0, 0, 0, 0]
+    inverted = [bytearray(bytes(row).translate(_FLIP_01_TABLE)) for row in rows]
+    candidates = (inverted, rows) if dark else (rows, inverted)
+    for candidate in candidates:
+        blob = _parse_barcode_blob(candidate)
+        if blob is not None:
+            return blob
+    return None
+
+
+def _near_aspect(aspect: float, target: float) -> bool:
+    """True when [aspect] is within 0.05 of [target]. Grid aspects land
+    within 0.5/h (<= 0.016 for h >= 32) of their nominal value, while
+    the formats sit 0.4+ apart, so 0.05 separates them cleanly."""
+    return abs(aspect - target) < 0.05
+
+
+def _try_parse_code(matrix: list[bytearray], width: int, height: int) -> bytes | None:
+    """Try to parse a pixel matrix as a Middle Out grid or barcode.
+    Returns the frame blob only when it parses as a valid frame.
+    Branches on the image aspect; each branch falls through to the next
+    on a parse failure, so a misclassified image only costs a failed
+    parse attempt, never a wrong frame."""
+    # 1. Stacked-row barcode (old format): exact structural match on the
+    # row width and band pitch. Runs first because a bar-grid can share
+    # the aspect of a short stacked barcode by coincidence; the
+    # guard-bar check rejects non-barcodes below.
+    for bar_px in (BARCODE_BAR_PX, 1):
+        row_stride = BARCODE_ROW_PX + BARCODE_GAP_PX
+        if width == BARCODE_ROW_BARS * bar_px and height % row_stride == 0:
+            row_count = height // row_stride
+            if row_count >= 1:
+                blob = _try_parse_barcode_matrix(matrix, bar_px, row_count)
+                if blob is not None:
+                    return blob
+    # 2. Bar-grid (new barcode): aspect ~5.657, no quiet zone.
+    if _near_aspect(width / height, BARCODE_ASPECT):
+        blob = _try_parse_grid_matrix(matrix)
+        if blob is not None:
+            return blob
+    # 3. Rectangular QR grid (new format): aspect ~1.414, no quiet zone.
+    if _near_aspect(width / height, QR_ASPECT):
+        blob = _try_parse_grid_matrix(matrix)
+        if blob is not None:
+            return blob
+    # 4. Square grid (old format / cover manifest): quiet zone of
+    # 4 modules (fall back to 0).
+    if width == height:
+        for quiet in (GRID_QUIET_MODULES, 0):
+            n = width - 2 * quiet
+            if n < GRID_MIN_HEIGHT:
+                continue
+            grid = [
+                bytearray(row[quiet : quiet + n])
+                for row in matrix[quiet : quiet + n]
+            ]
+            blob = _try_parse_grid_matrix(grid)
+            if blob is not None:
+                return blob
+    return None
+
+
+def extract_pdf_frames(pdf_bytes: bytes) -> PdfExtraction:
+    """Recover Middle Out frame blobs from an encoded PDF's image XObjects.
+    New-format PDFs carry 1-bit code images plus one RGB logo tile;
+    prefer the 1-bit images and never try to parse the logo. Old-format
+    PDFs have only 8-bit RGB code images (no 1-bit image exists), so
+    when no 1-bit image is present every image is attempted. Only blobs
+    that parse as valid frames are kept (deduplicated)."""
+    images = _find_images(pdf_bytes)
+    has_one_bit = any(
+        image.bits_per_component == 1 and image.colors == 1 for image in images
+    )
+    candidates = (
+        [i for i in images if i.bits_per_component == 1 and i.colors == 1]
+        if has_one_bit
+        else images
+    )
+    frames: list[bytes] = []
+    seen: set[str] = set()
+    parsed = 0
+    for image in candidates:
+        matrix = _decode_image(image)
+        if matrix is None:
+            continue
+        parsed += 1
+        blob = _try_parse_code(matrix, image.width, image.height)
+        if blob is None:
+            continue
+        key = f"{len(blob)}-{blob[:16].hex()}"
+        if key not in seen:
+            seen.add(key)
+            frames.append(blob)
+    return PdfExtraction(frames=frames, images_found=len(images), images_parsed=parsed)
+
+
+def decode_pdf(pdf_path: str, passphrase: str | None = None) -> bytes:
+    """Full loop: PDF -> frame images -> frames -> original bytes.
+    Light/dark and QR/barcode are auto-detected per page; old-format
+    PDFs (square grids, stacked-row barcodes, 8-bit RGB XObjects)
+    decode too."""
+    with open(pdf_path, "rb") as fh:
+        pdf_bytes = fh.read()
+    extraction = extract_pdf_frames(pdf_bytes)
+    if not extraction.frames:
+        raise CodecError("no Middle Out frames found in PDF")
+    return decode(extraction.frames, passphrase)
 
 
 # ---------------------------------------------------------------------------
@@ -943,6 +2009,7 @@ def _main(argv: list[str]) -> int:
         src, pdf_path = argv[2], argv[3]
         passphrase = None
         barcode = False
+        dark = False
         frames_dir = None
         i = 4
         while i < len(argv):
@@ -951,6 +2018,9 @@ def _main(argv: list[str]) -> int:
                 i += 2
             elif argv[i] == "--barcode":
                 barcode = True
+                i += 1
+            elif argv[i] == "--dark":
+                dark = True
                 i += 1
             elif argv[i] == "--frames-dir":
                 frames_dir = argv[i + 1]
@@ -961,10 +2031,11 @@ def _main(argv: list[str]) -> int:
         with open(src, "rb") as fh:
             data = fh.read()
         result = encode(data, passphrase, barcode=barcode)
-        pdf_stats = build_pdf(result, os.path.basename(src), pdf_path)
+        pdf_stats = build_pdf(result, os.path.basename(src), pdf_path, dark=dark)
+        theme = "dark" if dark else "light"
         print(f"encoded {len(data):,} bytes -> {result.stats.frame_count} frames "
               f"({result.stats.ratio:.1f}x) -> {pdf_path} "
-              f"({pdf_stats.pages} pages, {pdf_stats.size_bytes:,} bytes)")
+              f"({pdf_stats.pages} pages, {pdf_stats.size_bytes:,} bytes, {theme})")
         if frames_dir:
             os.makedirs(frames_dir, exist_ok=True)
             for frame in result.frames:

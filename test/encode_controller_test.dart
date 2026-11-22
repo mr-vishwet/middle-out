@@ -156,4 +156,43 @@ void main() {
       expect(controller.progressLabel, 'Done');
     });
   });
+
+  group('PDF theme toggle', () {
+    test('pdfDark defaults to light and setPdfDark flips it', () {
+      final controller = EncodeController();
+      expect(controller.pdfDark, isFalse);
+      controller.setPdfDark(true);
+      expect(controller.pdfDark, isTrue);
+      controller.setPdfDark(false);
+      expect(controller.pdfDark, isFalse);
+    });
+
+    test('reset keeps the theme toggle (like format and encryption)',
+        () async {
+      final controller = EncodeController();
+      controller.setPdfDark(true);
+      controller.reset();
+      expect(controller.pdfDark, isTrue);
+    });
+
+    test('dark encode succeeds end to end', () async {
+      final controller = EncodeController();
+      final unit = 'Middle Out dark encode test. '.codeUnits;
+      final bytes = Uint8List.fromList(
+        [for (var i = 0; i < 10; i++) ...unit],
+      );
+      controller.file = PickedRef(
+        name: 'note.txt',
+        size: bytes.length,
+        bytes: bytes,
+      );
+      controller.encrypted = false;
+      controller.setPdfDark(true);
+      controller.phase = EncodePhase.ready;
+      await controller.encode();
+      expect(controller.phase, EncodePhase.done);
+      expect(controller.pdfBytes, isNotNull);
+      expect(controller.pdfStats!.pages, controller.result!.frames.length + 1);
+    });
+  });
 }

@@ -60,6 +60,37 @@ void main() {
       expect(batch.items, isEmpty);
     });
 
+    test('pdfDark defaults to light, updates, and persists', () async {
+      final batch = BatchController();
+      await batch.load();
+      await batch.addItem(smallItem());
+      expect(batch.items.single.pdfDark, isFalse);
+      batch.updateOptions('b1', pdfDark: true);
+      expect(batch.items.single.pdfDark, isTrue);
+      final restored = BatchItem.fromJson(batch.items.single.toJson());
+      expect(restored.pdfDark, isTrue);
+      // Items persisted before pdfDark existed load as light.
+      final legacy = BatchItem.fromJson({
+        'id': 'old',
+        'name': 'old.txt',
+        'size': 10,
+        'path': '/tmp/old.txt',
+      });
+      expect(legacy.pdfDark, isFalse);
+    });
+
+    test('dark item builds a decodable dark PDF', () async {
+      final batch = BatchController();
+      await batch.load();
+      await batch.addItem(smallItem());
+      batch.updateOptions('b1', pdfDark: true);
+      await batch.runOne('b1');
+      final item = batch.items.single;
+      expect(item.status, BatchStatus.done);
+      expect(item.pdfBytes, isNotNull);
+      expect(item.pdfStats!.pages, item.result!.frames.length + 1);
+    });
+
     test('runAll runs queued items in order', () async {
       final batch = BatchController();
       await batch.load();

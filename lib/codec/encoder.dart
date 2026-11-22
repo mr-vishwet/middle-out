@@ -55,7 +55,7 @@ class EncodeResult {
   /// Encode statistics.
   final EncodeStats stats;
 
-  /// True when the frames render as stacked barcodes.
+  /// True when the frames render as bar-grid barcodes.
   final bool barcode;
 }
 

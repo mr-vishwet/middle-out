@@ -6,6 +6,7 @@ import '../state/app_scope.dart';
 import '../state/batch_controller.dart';
 import '../widgets/encryption_toggle.dart';
 import '../widgets/format_toggle.dart';
+import '../widgets/pdf_theme_toggle.dart';
 
 /// Batch queue (m10/w10): several files, each with its own settings,
 /// encoded in order.
@@ -150,7 +151,8 @@ class _BatchItemCard extends StatelessWidget {
         subtitle: Text(
           '${formatBytes(item.size)} · '
           '${item.barcode ? 'Barcode' : 'QR grid'} · '
-          '${item.encrypted ? 'Encrypted' : 'Plain'}',
+          '${item.encrypted ? 'Encrypted' : 'Plain'} · '
+          '${item.pdfDark ? 'Dark' : 'Light'}',
         ),
         children: [
           Padding(
@@ -219,6 +221,14 @@ class _BatchItemCard extends StatelessWidget {
                     onPassphraseChanged: (value) => batch.updateOptions(
                       item.id,
                       passphrase: value,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  PdfThemeToggle(
+                    dark: item.pdfDark,
+                    onChanged: (value) => batch.updateOptions(
+                      item.id,
+                      pdfDark: value,
                     ),
                   ),
                   const SizedBox(height: 12),

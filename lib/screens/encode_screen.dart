@@ -9,6 +9,7 @@ import '../state/app_scope.dart';
 import '../state/encode_controller.dart';
 import '../widgets/encryption_toggle.dart';
 import '../widgets/format_toggle.dart';
+import '../widgets/pdf_theme_toggle.dart';
 import '../widgets/frame_grid.dart';
 import '../widgets/limit_banner.dart';
 
@@ -121,8 +122,9 @@ class PickerScreen extends StatelessWidget {
                           ),
                           const _Step(
                             number: '2',
-                            text: 'Choose QR grid or barcode, and whether '
-                                'to encrypt (on by default).',
+                            text: 'Choose QR grid or barcode, light or dark '
+                                'pages, and whether to encrypt (on by '
+                                'default).',
                           ),
                           const _Step(
                             number: '3',
@@ -272,6 +274,11 @@ class PreEncodeScreen extends StatelessWidget {
                       FormatToggle(
                         barcode: controller.barcode,
                         onChanged: controller.setBarcode,
+                      ),
+                      const SizedBox(height: 16),
+                      PdfThemeToggle(
+                        dark: controller.pdfDark,
+                        onChanged: controller.setPdfDark,
                       ),
                     ],
                   ),
@@ -542,12 +549,8 @@ class _FirstFramePreview extends StatelessWidget {
   Widget build(BuildContext context) {
     final result = controller.result!;
     final raw = result.frames.first.toBytes();
-    if (result.barcode) {
-      return FrameCodeView(
-        grid: null,
-        barcodeRows: CodeGrid.buildBarcodeRows(raw),
-      );
-    }
-    return FrameCodeView(grid: CodeGrid.buildGrid(raw));
+    return FrameCodeView(
+      grid: CodeGrid.buildFrameGrid(raw, barcode: result.barcode),
+    );
   }
 }
