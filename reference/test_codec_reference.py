@@ -31,6 +31,50 @@ def _sample_text(repeats: int = 200) -> bytes:
     ) * repeats
 
 
+def _v1_frame_bytes(
+    frame_index,
+    kind,
+    group_index,
+    slot,
+    flags,
+    total_groups,
+    total_data_frames,
+    original_size,
+    compressed_size,
+    sha256,
+    payload,
+):
+    """Serialise one frame in the legacy v1 wire format (97-byte header,
+    uint8 indices) so the decoder's v1 compatibility can be tested.
+    Encoders never write v1 — only this helper does."""
+    header_wo_crc = struct.pack(
+        ">4sBBBBBBBHIQQ32s16s12s",
+        mo.MAGIC,
+        1,
+        frame_index,
+        kind,
+        group_index,
+        slot,
+        flags,
+        total_groups,
+        total_data_frames,
+        len(payload),
+        original_size,
+        compressed_size,
+        sha256,
+        bytes(16),
+        bytes(12),
+    )
+    header = header_wo_crc + struct.pack(
+        ">I", zlib.crc32(header_wo_crc) & 0xFFFFFFFF
+    )
+    return (
+        header
+        + payload
+        + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
+    )
+
+
 class ChaCha20Tests(unittest.TestCase):
     def test_rfc8439_section_a5_vector(self):
         # RFC 8439 Appendix A.5: key 00:01:...:1f, nonce
@@ -104,6 +148,85 @@ class RoundTripTests(unittest.TestCase):
         self.assertEqual(frame.total_groups, 1)
         self.assertEqual(frame.total_data_frames, 1)
         self.assertEqual(len(frame.to_bytes()), mo.HEADER_SIZE + len(frame.payload) + 4)
+
+    def test_v2_header_roundtrips_indices_above_255(self):
+        frame = mo.Frame(
+            frame_index=300,
+            kind=mo.KIND_DATA,
+            group_index=40,
+            slot=3,
+            flags=mo.FLAG_ENCRYPTED,
+            total_groups=50,
+            total_data_frames=300,
+            original_size=123456789,
+            compressed_size=98765432,
+            original_sha256=bytes(32),
+            salt=bytes(16),
+            nonce=bytes(12),
+            payload=bytes(100),
+        )
+        raw = frame.to_bytes()
+        self.assertEqual(raw[4], mo.VERSION)
+        self.assertEqual(len(raw), mo.HEADER_SIZE + 100 + 4)
+        parsed = mo.Frame.from_bytes(raw)
+        self.assertEqual(parsed.frame_index, 300)
+        self.assertEqual(parsed.group_index, 40)
+        self.assertEqual(parsed.total_groups, 50)
+        self.assertEqual(parsed.total_data_frames, 300)
+        self.assertEqual(parsed.original_size, 123456789)
+        self.assertEqual(parsed.compressed_size, 98765432)
+
+    def test_v1_frame_parses(self):
+        raw = _v1_frame_bytes(
+            200, mo.KIND_DATA, 30, 2, mo.FLAG_LAST_GROUP, 40, 200,
+            1234567, 765432, bytes(32), b"\x01\x02\x03\x04",
+        )
+        parsed = mo.Frame.from_bytes(raw)
+        self.assertEqual(parsed.frame_index, 200)
+        self.assertEqual(parsed.group_index, 30)
+        self.assertEqual(parsed.total_groups, 40)
+        self.assertEqual(parsed.total_data_frames, 200)
+        self.assertEqual(parsed.original_size, 1234567)
+        self.assertEqual(parsed.payload, b"\x01\x02\x03\x04")
+
+    def test_v1_blobs_decode(self):
+        # A tiny one-group encode in the v1 wire format still decodes.
+        data = _sample_text(40)
+        compressed = zlib.compress(data, 9)
+        sha = hashlib.sha256(data).digest()
+        blobs = [
+            _v1_frame_bytes(
+                0, mo.KIND_DATA, 0, 0, mo.FLAG_LAST_GROUP, 1, 1,
+                len(data), len(compressed), sha, compressed,
+            ),
+            _v1_frame_bytes(
+                1, mo.KIND_PARITY, 0, mo.PARITY_A_SLOT, mo.FLAG_LAST_GROUP,
+                1, 1, len(data), len(compressed), sha, compressed,
+            ),
+            _v1_frame_bytes(
+                2, mo.KIND_PARITY, 0, mo.PARITY_B_SLOT, mo.FLAG_LAST_GROUP,
+                1, 1, len(data), len(compressed), sha, b"",
+            ),
+        ]
+        self.assertEqual(mo.decode(blobs), data)
+
+    def test_more_than_256_frames_roundtrip(self):
+        # 13 MiB of incompressible data needs ~279 frames at the default
+        # 64 KiB payload — over the old 256 cap, under the 4096 cap.
+        data = os.urandom(13 * 1024 * 1024)
+        result = mo.encode(data)
+        self.assertGreater(len(result.frames), 256)
+        self.assertEqual(
+            mo.decode([f.to_bytes() for f in result.frames]), data
+        )
+
+    def test_over_cap_raises(self):
+        # A 1 KiB payload forces ~6,800 frames out of 5 MiB.
+        data = os.urandom(5 * 1024 * 1024)
+        with self.assertRaises(mo.CodecError) as ctx:
+            mo.encode(data, max_payload=1024)
+        self.assertIn("4096", str(ctx.exception))
+        self.assertIn("Split", str(ctx.exception))
 
 
 class ParityTests(unittest.TestCase):

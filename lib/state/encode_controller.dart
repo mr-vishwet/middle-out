@@ -42,10 +42,11 @@ enum EncodePhase {
   error,
 }
 
-/// A pre-encode estimate, sampled from the head of the file.
+/// A pre-encode estimate, sampled from the head, middle and tail of the
+/// file (or the whole file, when it is small).
 ///
-/// The ratio is measured on a 1 MiB sample and extrapolated; the UI
-/// labels it an estimate. Real ratios depend entirely on the input.
+/// The ratio is the worst (lowest) across the samples, extrapolated; the
+/// UI labels it an estimate. Real ratios depend entirely on the input.
 class EncodeEstimate {
   /// Creates an estimate.
   const EncodeEstimate({
@@ -54,6 +55,7 @@ class EncodeEstimate {
     required this.estimatedPdfBytes,
     required this.estimatedSeconds,
     required this.sampleBytes,
+    this.overCap = false,
   });
 
   /// Estimated compression ratio from the sample.
@@ -70,6 +72,10 @@ class EncodeEstimate {
 
   /// Bytes sampled for the estimate.
   final int sampleBytes;
+
+  /// True when the estimated frame count exceeds [kMaxFrames] — the
+  /// estimate screen warns before the user encodes.
+  final bool overCap;
 }
 
 /// State for the encode flow: picked file, toggles, progress, result.
@@ -90,8 +96,41 @@ class EncodeController extends ChangeNotifier {
   /// Files at or above this size use the streaming encoder on native.
   static const int streamingThresholdBytes = 32 * 1024 * 1024;
 
-  /// Sample size for the pre-encode estimate (1 MiB).
-  static const int estimateSampleBytes = 1024 * 1024;
+  /// Size of each estimate sample (256 KiB). Three are taken — head,
+  /// middle and tail — for 768 KiB total.
+  static const int estimateSampleChunkBytes = 256 * 1024;
+
+  /// Builds an estimate from a measured compression [ratio] and file
+  /// size. Pure (no I/O) so the frame-count and cap math is unit-testable.
+  static EncodeEstimate estimateFor({
+    required int fileSize,
+    required double ratio,
+    required int sampleBytes,
+  }) {
+    final clampedRatio = ratio.clamp(1.0, 1000.0);
+    final estCompressed = (fileSize / clampedRatio).ceil();
+    final dataFrames =
+        (estCompressed + kDefaultMaxPayload - 1) ~/ kDefaultMaxPayload;
+    final groups =
+        (dataFrames + kGroupDataFrames - 1) ~/ kGroupDataFrames;
+    final frames = dataFrames + groups * kGroupParityFrames;
+    return EncodeEstimate(
+      ratio: clampedRatio,
+      estimatedFrames: frames,
+      // ~60 KB per full-page code image + cover overhead.
+      estimatedPdfBytes: frames * 60000 + 20000,
+      estimatedSeconds:
+          (fileSize / (25 * 1024 * 1024)).ceil().clamp(1, 3600 * 24),
+      sampleBytes: sampleBytes,
+      overCap: frames > kMaxFrames,
+    );
+  }
+
+  /// Routing advice when an encode would exceed the frame cap.
+  static String capAdvice(int estimatedFrames) =>
+      'This file would need about $estimatedFrames frames — over the '
+      '$kMaxFrames-frame limit for one PDF. Split it into smaller files '
+      'and encode each one separately.';
 
   /// Current phase.
   EncodePhase phase = EncodePhase.idle;
@@ -218,7 +257,12 @@ class EncodeController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// (Re)computes the pre-encode estimate from a 1 MiB head sample.
+  /// (Re)computes the pre-encode estimate from head, middle and tail
+  /// samples, using the worst (lowest) ratio across them. A head-only
+  /// sample undershoots badly on media files: an .mp4's metadata head
+  /// compresses far better than its video data. Conservative beats
+  /// optimistic — an over-estimate only warns early, an under-estimate
+  /// fails the encode halfway through.
   Future<void> refreshEstimate() async {
     final current = file;
     if (current == null) {
@@ -226,29 +270,26 @@ class EncodeController extends ChangeNotifier {
       return;
     }
     try {
-      final sample = await _picker.readRefHead(
+      final samples = await _picker.readRefSamples(
         current,
-        estimateSampleBytes,
+        estimateSampleChunkBytes,
       );
-      final compressed = const ZLibEncoder().encode(sample, level: 9);
-      final sampleRatio = compressed.isEmpty
-          ? 1.0
-          : sample.length / compressed.length;
-      final ratio = sampleRatio.clamp(1.0, 1000.0);
-      final estCompressed = (current.size / ratio).ceil();
-      final dataFrames =
-          (estCompressed + kDefaultMaxPayload - 1) ~/ kDefaultMaxPayload;
-      final groups =
-          (dataFrames + kGroupDataFrames - 1) ~/ kGroupDataFrames;
-      final frames = dataFrames + groups * kGroupParityFrames;
-      estimate = EncodeEstimate(
+      var ratio = double.infinity;
+      var sampled = 0;
+      for (final sample in samples) {
+        if (sample.isEmpty) continue;
+        final compressed = const ZLibEncoder().encode(sample, level: 9);
+        final sampleRatio = compressed.isEmpty
+            ? 1.0
+            : sample.length / compressed.length;
+        if (sampleRatio < ratio) ratio = sampleRatio;
+        sampled += sample.length;
+      }
+      if (ratio.isInfinite) ratio = 1.0;
+      estimate = estimateFor(
+        fileSize: current.size,
         ratio: ratio,
-        estimatedFrames: frames,
-        // ~60 KB per full-page code image + cover overhead.
-        estimatedPdfBytes: frames * 60000 + 20000,
-        estimatedSeconds:
-            (current.size / (25 * 1024 * 1024)).ceil().clamp(1, 3600 * 24),
-        sampleBytes: sample.length,
+        sampleBytes: sampled,
       );
     } catch (_) {
       estimate = null;
@@ -256,13 +297,23 @@ class EncodeController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Records a failed encode. The progress bar resets to 0 and the label
+  /// reads 'Failed' so an error never sits next to a stale mid-encode
+  /// bar and stage (the old code left 15% + 'Compressing…' on screen,
+  /// which read as stuck, not failed).
+  void _fail(String message) {
+    error = message;
+    phase = EncodePhase.error;
+    progress = 0;
+    progressLabel = 'Failed';
+  }
+
   /// Runs the encode, then builds the PDF and records history.
   Future<void> encode() async {
     final current = file;
     if (current == null || phase == EncodePhase.encoding) return;
     if (encrypted && passphrase.isEmpty) {
-      error = 'Encryption is on — set a passphrase, or turn it off.';
-      phase = EncodePhase.error;
+      _fail('Encryption is on — set a passphrase, or turn it off.');
       notifyListeners();
       return;
     }
@@ -292,15 +343,16 @@ class EncodeController extends ChangeNotifier {
         );
       } else {
         streamed = false;
-        progress = 0.15;
-        progressLabel = 'Compressing…';
-        notifyListeners();
-        await Future<void>.delayed(Duration.zero);
         final bytes = await _picker.readRef(current);
-        encoded = Encoder.encode(
+        encoded = await Encoder.encodeAsync(
           bytes,
           passphrase: encrypted ? passphrase : null,
           barcode: barcode,
+          onProgress: (fraction, label) {
+            progress = fraction * 0.8;
+            progressLabel = label;
+            notifyListeners();
+          },
         );
       }
       progress = 0.85;
@@ -330,11 +382,9 @@ class EncodeController extends ChangeNotifier {
       );
       await onEncoded?.call(record);
     } on CodecException catch (e) {
-      error = e.message;
-      phase = EncodePhase.error;
+      _fail(e.message);
     } catch (e) {
-      error = 'Encode failed: $e';
-      phase = EncodePhase.error;
+      _fail('Encode failed: $e');
     }
     notifyListeners();
   }

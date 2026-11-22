@@ -351,7 +351,10 @@ class PdfFrameExtractor {
   /// The cover manifest grid parses to text and fails here, so it is
   /// skipped rather than treated as a frame.
   static bool _isFrame(Uint8List blob) {
-    if (blob.length < kHeaderSize + 4) return false;
+    // Pre-filter on the SMALLEST header (v1, 97 bytes): a v1 frame with
+    // an empty payload is only 101 bytes, and the real validation happens
+    // in Frame.fromBytes below.
+    if (blob.length < kHeaderSizeV1 + 4) return false;
     for (var i = 0; i < 4; i++) {
       if (blob[i] != kFrameMagic[i]) return false;
     }

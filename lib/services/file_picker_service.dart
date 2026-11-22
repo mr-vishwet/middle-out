@@ -130,4 +130,42 @@ class FilePickerService {
     if (ref.path != null) return readFileHead(ref.path!, maxBytes);
     throw const FileTooLargeException('Could not read the picked file.');
   }
+
+  /// Reads up to three estimate samples from a referenced file: head,
+  /// middle and tail, each [sampleSize] bytes. A file no bigger than
+  /// 3×[sampleSize] is read whole as a single sample — small enough that
+  /// the measured ratio is exact, not estimated.
+  Future<List<Uint8List>> readRefSamples(
+    PickedRef ref,
+    int sampleSize,
+  ) async {
+    final size = ref.size;
+    if (size <= 3 * sampleSize) {
+      if (ref.bytes != null) return [ref.bytes!];
+      if (ref.path != null) return [await readPickedFile(ref.path!)];
+      throw const FileTooLargeException('Could not read the picked file.');
+    }
+    final offsets = [
+      0,
+      size ~/ 2 - sampleSize ~/ 2,
+      size - sampleSize,
+    ];
+    final samples = <Uint8List>[];
+    for (final offset in offsets) {
+      if (ref.bytes != null) {
+        samples.add(
+          Uint8List.sublistView(
+            ref.bytes!,
+            offset,
+            offset + sampleSize,
+          ),
+        );
+      } else if (ref.path != null) {
+        samples.add(await readFileRange(ref.path!, offset, sampleSize));
+      } else {
+        throw const FileTooLargeException('Could not read the picked file.');
+      }
+    }
+    return samples;
+  }
 }

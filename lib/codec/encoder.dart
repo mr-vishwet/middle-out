@@ -59,16 +59,24 @@ class EncodeResult {
   final bool barcode;
 }
 
+/// Progress callback for staged encodes: [fraction] 0..1 of the encode
+/// step and a human-readable stage label.
+typedef EncodeProgress = void Function(double fraction, String label);
+
 /// Encodes a file into Middle Out frames.
 ///
 /// Pipeline: SHA-256 -> zlib-9 compress -> (optional ChaCha20 encrypt) ->
 /// split into <= [maxPayload] chunks -> group into 6 DATA + 2 XOR-parity.
 ///
-/// [encode] works on bytes already in memory. [StreamingEncoder] runs the
-/// same pipeline chunk-by-chunk off disk for large native files; both
-/// share [buildFrames], so a streamed encode is byte-identical in framing
-/// to an in-memory one (compression output may differ by chunking, which
-/// is fine — zlib streams are self-describing).
+/// [encode] works on bytes already in memory, synchronously.
+/// [encodeAsync] runs the same pipeline in stages, yielding to the event
+/// loop between them so the UI can repaint the progress bar — the
+/// synchronous [encode] blocks the UI thread for the whole run, so the
+/// bar cannot move during it. [StreamingEncoder] runs the same pipeline
+/// chunk-by-chunk off disk for large native files; all three share
+/// [buildFrames], so a streamed encode is byte-identical in framing to
+/// an in-memory one (compression output may differ by chunking, which is
+/// fine — zlib streams are self-describing).
 class Encoder {
   /// Encodes [data]. Pass [passphrase] to encrypt (default ON in the UI);
   /// pass null for a plain encode whose payload is human-readable.
@@ -78,37 +86,115 @@ class Encoder {
     int maxPayload = kDefaultMaxPayload,
     bool barcode = false,
   }) {
-    final sha = Uint8List.fromList(sha256.convert(data).bytes);
-    final compressed =
-        Uint8List.fromList(const ZLibEncoder().encode(data, level: 9));
+    final sha = _hash(data);
+    final compressed = _compress(data);
+    final encrypted = _maybeEncrypt(compressed, passphrase);
+    final chunks = _chunk(encrypted.stream, maxPayload);
+    return _finish(
+      data: data,
+      sha: sha,
+      stream: encrypted.stream,
+      chunks: chunks,
+      salt: encrypted.salt,
+      nonce: encrypted.nonce,
+      encrypted: passphrase != null,
+      barcode: barcode,
+    );
+  }
 
-    final encrypted = passphrase != null;
-    final Uint8List salt;
-    final Uint8List nonce;
-    final Uint8List stream;
-    if (encrypted) {
-      final random = Random.secure();
-      salt = Uint8List.fromList(
-        List<int>.generate(kSaltLength, (_) => random.nextInt(256)),
-      );
-      nonce = Uint8List.fromList(
-        List<int>.generate(kNonceLength, (_) => random.nextInt(256)),
-      );
-      final key = deriveKey(passphrase, salt);
-      stream = ChaCha20.xor(key, nonce, compressed);
-    } else {
-      salt = Uint8List(kSaltLength);
-      nonce = Uint8List(kNonceLength);
-      stream = compressed;
+  /// Staged async encode: same pipeline and output as [encode], but each
+  /// stage reports through [onProgress] and yields first, so the UI
+  /// paints the new stage before the next blocking chunk of work starts.
+  /// The heavy stages (zlib, ChaCha20) still run synchronously — the
+  /// yields only let the frame paint between stages.
+  static Future<EncodeResult> encodeAsync(
+    Uint8List data, {
+    String? passphrase,
+    int maxPayload = kDefaultMaxPayload,
+    bool barcode = false,
+    EncodeProgress? onProgress,
+  }) async {
+    onProgress?.call(0.05, 'Hashing…');
+    await Future<void>.delayed(Duration.zero);
+    final sha = _hash(data);
+    onProgress?.call(0.15, 'Compressing…');
+    await Future<void>.delayed(Duration.zero);
+    final compressed = _compress(data);
+    final isEncrypted = passphrase != null;
+    if (isEncrypted) {
+      onProgress?.call(0.6, 'Encrypting…');
+      await Future<void>.delayed(Duration.zero);
     }
+    final encrypted = _maybeEncrypt(compressed, passphrase);
+    onProgress?.call(0.7, 'Framing…');
+    await Future<void>.delayed(Duration.zero);
+    final chunks = _chunk(encrypted.stream, maxPayload);
+    final result = _finish(
+      data: data,
+      sha: sha,
+      stream: encrypted.stream,
+      chunks: chunks,
+      salt: encrypted.salt,
+      nonce: encrypted.nonce,
+      encrypted: isEncrypted,
+      barcode: barcode,
+    );
+    onProgress?.call(0.95, 'Framing…');
+    return result;
+  }
 
+  static Uint8List _hash(Uint8List data) =>
+      Uint8List.fromList(sha256.convert(data).bytes);
+
+  static Uint8List _compress(Uint8List data) =>
+      Uint8List.fromList(const ZLibEncoder().encode(data, level: 9));
+
+  static ({Uint8List salt, Uint8List nonce, Uint8List stream}) _maybeEncrypt(
+    Uint8List compressed,
+    String? passphrase,
+  ) {
+    if (passphrase == null) {
+      return (
+        salt: Uint8List(kSaltLength),
+        nonce: Uint8List(kNonceLength),
+        stream: compressed,
+      );
+    }
+    final random = Random.secure();
+    final salt = Uint8List.fromList(
+      List<int>.generate(kSaltLength, (_) => random.nextInt(256)),
+    );
+    final nonce = Uint8List.fromList(
+      List<int>.generate(kNonceLength, (_) => random.nextInt(256)),
+    );
+    final key = deriveKey(passphrase, salt);
+    return (
+      salt: salt,
+      nonce: nonce,
+      stream: ChaCha20.xor(key, nonce, compressed),
+    );
+  }
+
+  static List<Uint8List> _chunk(Uint8List stream, int maxPayload) {
     final chunks = <Uint8List>[];
     for (var i = 0; i < stream.length; i += maxPayload) {
       final end = math.min(i + maxPayload, stream.length);
       chunks.add(Uint8List.sublistView(stream, i, end));
     }
     if (chunks.isEmpty) chunks.add(Uint8List(0));
+    return chunks;
+  }
 
+  static EncodeResult _finish({
+    required Uint8List data,
+    required Uint8List sha,
+    required Uint8List stream,
+    required List<Uint8List> chunks,
+    required Uint8List salt,
+    required Uint8List nonce,
+    required bool encrypted,
+    required bool barcode,
+  }) {
     final frames = buildFrames(
       chunks: chunks,
       sha256Bytes: sha,
@@ -156,8 +242,9 @@ class Encoder {
     final totalFrames = totalData + totalGroups * kGroupParityFrames;
     if (totalFrames > kMaxFrames) {
       throw CodecException(
-        'encode needs $totalFrames frames, max is $kMaxFrames; '
-        'raise maxPayload or split the file',
+        'This file needs $totalFrames frames — over the $kMaxFrames-frame '
+        'limit for one PDF. Split it into smaller files and encode each '
+        'one separately.',
       );
     }
 

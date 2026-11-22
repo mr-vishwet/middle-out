@@ -59,10 +59,13 @@ class Crc32 {
   }
 }
 
-/// One Middle Out frame: a 97-byte header + payload + 4-byte payload CRC.
+/// One Middle Out frame: a 100-byte v2 header + payload + 4-byte payload
+/// CRC.
 ///
 /// Wire format is defined in `lib/core/constants.dart` and mirrored
-/// byte-for-byte by `reference/codec_reference.py`.
+/// byte-for-byte by `reference/codec_reference.py`. [toBytes] always
+/// writes v2; [Frame.fromBytes] also parses v1 frames (97-byte header)
+/// so PDFs encoded before the v2 widening still decode.
 class Frame {
   /// Creates a frame from its header fields and [payload].
   const Frame({
@@ -140,7 +143,7 @@ class Frame {
   /// True when this frame is in the last group ([kFlagLastGroup]).
   bool get isLastGroup => flags & kFlagLastGroup != 0;
 
-  /// Serialises the frame: header + payload + payload CRC.
+  /// Serialises the frame: v2 header + payload + payload CRC.
   Uint8List toBytes() {
     final header = ByteData(kHeaderSize);
     header.setUint8(0, kFrameMagic[0]);
@@ -148,27 +151,27 @@ class Frame {
     header.setUint8(2, kFrameMagic[2]);
     header.setUint8(3, kFrameMagic[3]);
     header.setUint8(4, kFrameVersion);
-    header.setUint8(5, frameIndex);
-    header.setUint8(6, kind);
-    header.setUint8(7, groupIndex);
-    header.setUint8(8, slot);
-    header.setUint8(9, flags);
-    header.setUint8(10, totalGroups);
-    header.setUint16(11, totalDataFrames);
-    header.setUint32(13, payload.length);
-    header.setUint64(17, originalSize);
-    header.setUint64(25, compressedSize);
+    header.setUint16(5, frameIndex);
+    header.setUint8(7, kind);
+    header.setUint16(8, groupIndex);
+    header.setUint8(10, slot);
+    header.setUint8(11, flags);
+    header.setUint16(12, totalGroups);
+    header.setUint16(14, totalDataFrames);
+    header.setUint32(16, payload.length);
+    header.setUint64(20, originalSize);
+    header.setUint64(28, compressedSize);
     for (var i = 0; i < 32; i++) {
-      header.setUint8(33 + i, originalSha256[i]);
+      header.setUint8(36 + i, originalSha256[i]);
     }
     for (var i = 0; i < 16; i++) {
-      header.setUint8(65 + i, salt[i]);
+      header.setUint8(68 + i, salt[i]);
     }
     for (var i = 0; i < 12; i++) {
-      header.setUint8(81 + i, nonce[i]);
+      header.setUint8(84 + i, nonce[i]);
     }
     final headerBytes = header.buffer.asUint8List(0, kHeaderSize - 4);
-    header.setUint32(93, Crc32.checksum(headerBytes));
+    header.setUint32(96, Crc32.checksum(headerBytes));
 
     final out = BytesBuilder()
       ..add(header.buffer.asUint8List())
@@ -178,12 +181,16 @@ class Frame {
     return out.toBytes();
   }
 
-  /// Parses a serialised frame. Throws [CorruptFrameException] when the
-  /// header is unreadable (bad magic, version, length or header CRC). A
-  /// payload CRC failure does NOT throw — it sets [payloadCorrupt] so the
-  /// decoder can rebuild the frame from parity.
+  /// Parses a serialised frame, v2 or v1. The version byte (offset 4)
+  /// picks the layout: v2 has a 100-byte header with uint16 indices,
+  /// v1 a 97-byte header with uint8 indices. Throws
+  /// [CorruptFrameException] when the header is unreadable (bad magic,
+  /// version, length or header CRC). A payload CRC failure does NOT
+  /// throw — it sets [payloadCorrupt] so the decoder can rebuild the
+  /// frame from parity.
   factory Frame.fromBytes(Uint8List raw) {
-    if (raw.length < kHeaderSize + 4) {
+    // Smallest possible frame is a v1 frame with an empty payload.
+    if (raw.length < kHeaderSizeV1 + 4) {
       throw const CorruptFrameException('frame shorter than header + CRC');
     }
     for (var i = 0; i < 4; i++) {
@@ -191,44 +198,99 @@ class Frame {
         throw const CorruptFrameException('bad magic');
       }
     }
-    final header = ByteData.sublistView(raw, 0, kHeaderSize);
-    final version = header.getUint8(4);
-    if (version != kFrameVersion) {
+    final version = raw[4];
+    final bool v2;
+    if (version == kFrameVersion) {
+      v2 = true;
+    } else if (version == 1) {
+      v2 = false;
+    } else {
       throw CorruptFrameException('unsupported frame version $version');
     }
-    final storedCrc = header.getUint32(93);
+    final headerSize = v2 ? kHeaderSize : kHeaderSizeV1;
+    if (raw.length < headerSize + 4) {
+      throw const CorruptFrameException('frame shorter than header + CRC');
+    }
+    final header = ByteData.sublistView(raw, 0, headerSize);
+    final storedCrc = header.getUint32(headerSize - 4);
     final computedCrc =
-        Crc32.checksum(raw.sublist(0, kHeaderSize - 4));
+        Crc32.checksum(raw.sublist(0, headerSize - 4));
     if (storedCrc != computedCrc) {
       throw const CorruptFrameException('header CRC mismatch');
     }
-    final payloadLength = header.getUint32(13);
-    if (raw.length != kHeaderSize + payloadLength + 4) {
+    // v1 offsets: frameIndex @5, kind @6, groupIndex @7, slot @8,
+    // flags @9, totalGroups @10 (all uint8), totalDataFrames @11..12,
+    // payloadLength @13..16, originalSize @17..24, compressedSize @25..32,
+    // SHA-256 @33, salt @65, nonce @81. v2 widens the three indices to
+    // uint16, shifting everything after them by 3 bytes.
+    final int frameIndex;
+    final int kind;
+    final int groupIndex;
+    final int slot;
+    final int flags;
+    final int totalGroups;
+    final int totalDataFrames;
+    final int payloadLength;
+    final int originalSize;
+    final int compressedSize;
+    final int shaOffset;
+    final int saltOffset;
+    final int nonceOffset;
+    if (v2) {
+      frameIndex = header.getUint16(5);
+      kind = header.getUint8(7);
+      groupIndex = header.getUint16(8);
+      slot = header.getUint8(10);
+      flags = header.getUint8(11);
+      totalGroups = header.getUint16(12);
+      totalDataFrames = header.getUint16(14);
+      payloadLength = header.getUint32(16);
+      originalSize = header.getUint64(20);
+      compressedSize = header.getUint64(28);
+      shaOffset = 36;
+      saltOffset = 68;
+      nonceOffset = 84;
+    } else {
+      frameIndex = header.getUint8(5);
+      kind = header.getUint8(6);
+      groupIndex = header.getUint8(7);
+      slot = header.getUint8(8);
+      flags = header.getUint8(9);
+      totalGroups = header.getUint8(10);
+      totalDataFrames = header.getUint16(11);
+      payloadLength = header.getUint32(13);
+      originalSize = header.getUint64(17);
+      compressedSize = header.getUint64(25);
+      shaOffset = 33;
+      saltOffset = 65;
+      nonceOffset = 81;
+    }
+    if (raw.length != headerSize + payloadLength + 4) {
       throw CorruptFrameException(
         'frame length ${raw.length} != header + $payloadLength + CRC',
       );
     }
     final payload = Uint8List.sublistView(
       raw,
-      kHeaderSize,
-      kHeaderSize + payloadLength,
+      headerSize,
+      headerSize + payloadLength,
     );
     final payloadCrc =
-        ByteData.sublistView(raw, kHeaderSize + payloadLength).getUint32(0);
+        ByteData.sublistView(raw, headerSize + payloadLength).getUint32(0);
     final corrupt = Crc32.checksum(payload) != payloadCrc;
     return Frame(
-      frameIndex: header.getUint8(5),
-      kind: header.getUint8(6),
-      groupIndex: header.getUint8(7),
-      slot: header.getUint8(8),
-      flags: header.getUint8(9),
-      totalGroups: header.getUint8(10),
-      totalDataFrames: header.getUint16(11),
-      originalSize: header.getUint64(17),
-      compressedSize: header.getUint64(25),
-      originalSha256: Uint8List.sublistView(raw, 33, 65),
-      salt: Uint8List.sublistView(raw, 65, 81),
-      nonce: Uint8List.sublistView(raw, 81, 93),
+      frameIndex: frameIndex,
+      kind: kind,
+      groupIndex: groupIndex,
+      slot: slot,
+      flags: flags,
+      totalGroups: totalGroups,
+      totalDataFrames: totalDataFrames,
+      originalSize: originalSize,
+      compressedSize: compressedSize,
+      originalSha256: Uint8List.sublistView(raw, shaOffset, shaOffset + 32),
+      salt: Uint8List.sublistView(raw, saltOffset, saltOffset + 16),
+      nonce: Uint8List.sublistView(raw, nonceOffset, nonceOffset + 12),
       payload: Uint8List.fromList(payload),
       payloadCorrupt: corrupt,
     );

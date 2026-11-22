@@ -13,34 +13,48 @@ library;
 /// Magic bytes at the start of every frame: ASCII "MO01".
 const List<int> kFrameMagic = [0x4D, 0x4F, 0x30, 0x31];
 
-/// Frame format version. Decoders must reject any other version.
-const int kFrameVersion = 1;
+/// Frame format version. Encoders write this version; decoders accept it
+/// and v1 (see [kHeaderSizeV1]) so PDFs encoded before the v2 widening
+/// still decode.
+const int kFrameVersion = 2;
 
-/// Fixed header size in bytes. Layout (all integers big-endian):
+/// Fixed header size in bytes (v2). Layout (all integers big-endian):
 ///
 /// ```
 ///  0..3    magic            "MO01"
-///  4       version          1
-///  5       frameIndex       global index of this frame in the encode
-///  6       kind             0 = DATA, 1 = PARITY
-///  7       groupIndex       which 8-frame group this frame belongs to
-///  8       slot             0..7 position inside its group (0-5 DATA, 6-7 PARITY)
-///  9       flags            bit0 = encrypted, bit1 = last group
-/// 10       totalGroups      number of 8-frame groups in the encode
-/// 11..12   totalDataFrames  number of DATA frames in the encode (uint16)
-/// 13..16   payloadLength    bytes of payload in this frame (uint32)
-/// 17..24   originalSize     bytes of the original file (uint64)
-/// 25..32   compressedSize   bytes of the compressed (and encrypted, if
+///  4       version          2
+///  5..6    frameIndex       global index of this frame in the encode (uint16)
+///  7       kind             0 = DATA, 1 = PARITY
+///  8..9    groupIndex       which 8-frame group this frame belongs to (uint16)
+/// 10       slot             0..7 position inside its group (0-5 DATA, 6-7 PARITY)
+/// 11       flags            bit0 = encrypted, bit1 = last group, bit2 = barcode
+/// 12..13   totalGroups      number of 8-frame groups in the encode (uint16)
+/// 14..15   totalDataFrames  number of DATA frames in the encode (uint16)
+/// 16..19   payloadLength    bytes of payload in this frame (uint32)
+/// 20..27   originalSize     bytes of the original file (uint64)
+/// 28..35   compressedSize   bytes of the compressed (and encrypted, if
 ///                           flagged) stream (uint64)
-/// 33..64   originalSha256   SHA-256 of the original file
-/// 65..80   salt             PBKDF2 salt, 16 bytes (zero when not encrypted)
-/// 81..92   nonce            ChaCha20 nonce, 12 bytes (zero when not encrypted)
-/// 93..96   headerCrc        CRC32 of header bytes 0..92
+/// 36..67   originalSha256   SHA-256 of the original file
+/// 68..83   salt             PBKDF2 salt, 16 bytes (zero when not encrypted)
+/// 84..95   nonce            ChaCha20 nonce, 12 bytes (zero when not encrypted)
+/// 96..99   headerCrc        CRC32 of header bytes 0..95
 /// ```
 ///
 /// The payload follows the header, then a 4-byte CRC32 of the payload.
 /// Frame total size = [kHeaderSize] + payloadLength + 4.
-const int kHeaderSize = 97;
+///
+/// v2 widened frameIndex, groupIndex and totalGroups from uint8 to uint16:
+/// a v1 frame could only address 256 frames, and a real 67 MB mp4 already
+/// needs 1,125. The magic and version keep their positions so a parser
+/// can tell v1 from v2 from the first five bytes.
+const int kHeaderSize = 100;
+
+/// v1 header size in bytes. v1 layout: frameIndex @5, kind @6, groupIndex
+/// @7, slot @8, flags @9, totalGroups @10 (all uint8), totalDataFrames
+/// @11..12, payloadLength @13..16, originalSize @17..24, compressedSize
+/// @25..32, SHA-256 @33..64, salt @65..80, nonce @81..92, header CRC
+/// @93..96. Decoders still parse it; encoders never write it.
+const int kHeaderSizeV1 = 97;
 
 /// Frame kind: a data frame carrying compressed-stream bytes.
 const int kFrameKindData = 0;
@@ -86,8 +100,17 @@ const int kParityBSlot = 7;
 /// of a full-page code at print resolution — see README "Honest limits".
 const int kDefaultMaxPayload = 65536;
 
-/// Maximum frames in one encode (frameIndex is a single byte).
-const int kMaxFrames = 256;
+/// Maximum frames in one encode.
+///
+/// This is a policy guardrail, not a format limit: v2 widened frameIndex
+/// to uint16, so the format itself can address 65,535 frames, and this
+/// cap can be raised later without another format change. 4096 covers the
+/// 1 GB hero case (~300 frames) 13x over and the largest real-world
+/// report so far (a 67 MB mp4 needing 1,125 frames) 3.6x over, while
+/// bounding the PDF at ~250 MB (4,096 full-page codes) and in-memory
+/// frame payloads at ~256 MB. Beyond that the PDF itself is unusable, and
+/// the estimate screen warns before encoding starts.
+const int kMaxFrames = 4096;
 
 /// ---------------------------------------------------------------------------
 /// Encryption (ChaCha20, RFC 8439 — pure Dart, no platform dependency)

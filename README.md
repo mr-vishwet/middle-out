@@ -36,30 +36,37 @@ centre of each code. Format toggle (QR vs Barcode, default QR) +
 encrypted toggle (default ON: encrypted payload is not human-readable
 when scanned; plain payload is).
 
-### Frame wire format (v1)
+### Frame wire format (v2)
 
-97-byte header + payload + 4-byte payload CRC32. Every frame carries the
+100-byte header + payload + 4-byte payload CRC32. Every frame carries the
 full encode metadata, so any single frame identifies the file it belongs
 to:
 
 | Bytes | Field |
 |---|---|
 | 0–3 | Magic `"MO01"` |
-| 4 | Version (1) |
-| 5 | Frame index (global) |
-| 6 | Kind (0 = DATA, 1 = PARITY) |
-| 7 | Group index |
-| 8 | Slot in group (0–5 DATA, 6–7 PARITY) |
-| 9 | Flags (bit0 encrypted, bit1 last group, bit2 barcode) |
-| 10 | Total groups |
-| 11–12 | Total DATA frames |
-| 13–16 | Payload length |
-| 17–24 | Original size |
-| 25–32 | Compressed (+encrypted) stream size |
-| 33–64 | SHA-256 of the original |
-| 65–80 | PBKDF2 salt (16 B, zero when plain) |
-| 81–92 | ChaCha20 nonce (12 B, zero when plain) |
-| 93–96 | Header CRC32 |
+| 4 | Version (2) |
+| 5–6 | Frame index, global (uint16) |
+| 7 | Kind (0 = DATA, 1 = PARITY) |
+| 8–9 | Group index (uint16) |
+| 10 | Slot in group (0–5 DATA, 6–7 PARITY) |
+| 11 | Flags (bit0 encrypted, bit1 last group, bit2 barcode) |
+| 12–13 | Total groups (uint16) |
+| 14–15 | Total DATA frames (uint16) |
+| 16–19 | Payload length |
+| 20–27 | Original size |
+| 28–35 | Compressed (+encrypted) stream size |
+| 36–67 | SHA-256 of the original |
+| 68–83 | PBKDF2 salt (16 B, zero when plain) |
+| 84–95 | ChaCha20 nonce (12 B, zero when plain) |
+| 96–99 | Header CRC32 |
+
+v2 widened the frame index, group index and total groups from uint8 to
+uint16: v1 could only address 256 frames, and a real 67 MB mp4 already
+needs 1,125. The format can now address 65,535 frames; the encode cap
+is 4,096 frames as a policy guardrail (it bounds the PDF at ~250 MB).
+Decoders still parse v1 frames (97-byte header), so PDFs encoded before
+the widening still decode.
 
 **Erasure coding:** parity A = XOR of data slots 0, 1, 2; parity B = XOR
 of slots 3, 4, 5. Each trio survives any single lost or corrupt frame.

@@ -5,7 +5,7 @@ This is a byte-for-byte mirror of the Dart codec in lib/codec/. It exists so
 the wire format, erasure coding, encryption and PDF assembly can be validated
 without a Flutter toolchain. The Dart side and this file MUST agree on:
 
-  * the 97-byte frame header layout (see HEADER below),
+  * the 100-byte v2 frame header layout (v1's 97-byte header still parses),
   * zlib level-9 compression of the whole file before chunking,
   * ChaCha20 (RFC 8439) with a PBKDF2-HMAC-SHA256 derived key,
   * XOR parity: 6 DATA + 2 PARITY per group, trios (0,1,2) and (3,4,5),
@@ -33,10 +33,20 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 MAGIC = b"MO01"
-VERSION = 1
-HEADER_SIZE = 97
-HEADER_STRUCT = ">4sBBBBBBBH I Q Q 32s 16s 12s I".replace(" ", "")
+VERSION = 2
+HEADER_SIZE = 100
+# v2 layout: magic 4s, version B, frame_index H, kind B, group_index H,
+# slot B, flags B, total_groups H, total_data_frames H, payload_len I,
+# original_size Q, compressed_size Q, sha256 32s, salt 16s, nonce 12s,
+# header_crc I. v2 widened the three indices from uint8 to uint16: v1
+# could only address 256 frames, and a real 67 MB mp4 needs 1,125.
+HEADER_STRUCT = ">4sBHBHBBHHIQQ32s16s12sI"
 assert struct.calcsize(HEADER_STRUCT) == HEADER_SIZE
+# v1 layout (still parsed, never written): frame_index/group_index/
+# total_groups are uint8, everything after them sits 3 bytes earlier.
+HEADER_SIZE_V1 = 97
+HEADER_STRUCT_V1 = ">4sBBBBBBBHIQQ32s16s12sI"
+assert struct.calcsize(HEADER_STRUCT_V1) == HEADER_SIZE_V1
 
 KIND_DATA = 0
 KIND_PARITY = 1
@@ -54,7 +64,12 @@ PARITY_A_SLOT = 6
 PARITY_B_SLOT = 7
 
 DEFAULT_MAX_PAYLOAD = 65536
-MAX_FRAMES = 256
+# Policy guardrail, not a format limit: v2 frame_index is uint16, so the
+# format can address 65,535 frames. 4096 covers the 1 GB hero case
+# (~300 frames) 13x over and the largest real-world report so far (a
+# 67 MB mp4 needing 1,125 frames) 3.6x over, while bounding the PDF at
+# ~250 MB and in-memory frame payloads at ~256 MB.
+MAX_FRAMES = 4096
 
 PBKDF2_ITERATIONS = 100_000
 SALT_LEN = 16
@@ -155,7 +170,8 @@ def derive_key(passphrase: str, salt: bytes) -> bytes:
 
 @dataclass
 class Frame:
-    """One Middle Out frame: a 97-byte header + payload + 4-byte payload CRC."""
+    """One Middle Out frame: a 100-byte v2 header + payload + 4-byte payload
+    CRC. to_bytes always writes v2; from_bytes also parses v1 frames."""
 
     frame_index: int
     kind: int
@@ -186,7 +202,7 @@ class Frame:
 
     def to_bytes(self) -> bytes:
         header_wo_crc = struct.pack(
-            ">4sBBBBBBBH I Q Q 32s 16s 12s".replace(" ", ""),
+            ">4sBHBHBBHHIQQ32s16s12s",
             MAGIC,
             VERSION,
             self.frame_index,
@@ -210,13 +226,25 @@ class Frame:
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> "Frame":
-        if len(raw) < HEADER_SIZE + 4:
+        # Smallest possible frame is a v1 frame with an empty payload.
+        if len(raw) < HEADER_SIZE_V1 + 4:
             raise CorruptFrameError("frame shorter than header + CRC")
-        header = raw[:HEADER_SIZE]
-        fields = struct.unpack(HEADER_STRUCT, header)
+        if raw[:4] != MAGIC:
+            raise CorruptFrameError("bad magic")
+        version = raw[4]
+        if version == VERSION:
+            header_size, header_struct = HEADER_SIZE, HEADER_STRUCT
+        elif version == 1:
+            header_size, header_struct = HEADER_SIZE_V1, HEADER_STRUCT_V1
+        else:
+            raise CorruptFrameError(f"unsupported frame version {version}")
+        if len(raw) < header_size + 4:
+            raise CorruptFrameError("frame shorter than header + CRC")
+        header = raw[:header_size]
+        fields = struct.unpack(header_struct, header)
         (
-            magic,
-            version,
+            _magic,
+            _version,
             frame_index,
             kind,
             group_index,
@@ -232,18 +260,14 @@ class Frame:
             nonce,
             header_crc,
         ) = fields
-        if magic != MAGIC:
-            raise CorruptFrameError("bad magic")
-        if version != VERSION:
-            raise CorruptFrameError(f"unsupported frame version {version}")
-        if zlib.crc32(header[: HEADER_SIZE - 4]) & _MASK32 != header_crc:
+        if zlib.crc32(header[: header_size - 4]) & _MASK32 != header_crc:
             raise CorruptFrameError("header CRC mismatch")
-        if len(raw) != HEADER_SIZE + payload_len + 4:
+        if len(raw) != header_size + payload_len + 4:
             raise CorruptFrameError(
                 f"frame length {len(raw)} != header + {payload_len} + CRC"
             )
-        payload = raw[HEADER_SIZE : HEADER_SIZE + payload_len]
-        (payload_crc,) = struct.unpack(">I", raw[HEADER_SIZE + payload_len :])
+        payload = raw[header_size : header_size + payload_len]
+        (payload_crc,) = struct.unpack(">I", raw[header_size + payload_len :])
         corrupt = zlib.crc32(payload) & _MASK32 != payload_crc
         return cls(
             frame_index=frame_index,
@@ -326,8 +350,9 @@ def encode(
     total_frames = total_data + total_groups * GROUP_PARITY_FRAMES
     if total_frames > MAX_FRAMES:
         raise CodecError(
-            f"encode needs {total_frames} frames, max is {MAX_FRAMES}; "
-            "raise max_payload or split the file"
+            f"This file needs {total_frames} frames — over the {MAX_FRAMES}-frame "
+            "limit for one PDF. Split it into smaller files and encode each "
+            "one separately."
         )
 
     base_flags = (FLAG_ENCRYPTED if encrypted else 0) | (FLAG_BARCODE if barcode else 0)

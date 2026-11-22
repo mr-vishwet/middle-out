@@ -351,10 +351,23 @@ class _EstimateRows extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         Text(
-          'Measured on a ${formatBytes(estimate.sampleBytes)} sample and '
-          'extrapolated — real ratios depend on the file.',
+          controller.file != null &&
+                  estimate.sampleBytes >= controller.file!.size
+              ? 'Measured on the whole file — the ratio is exact.'
+              : 'Measured on head, middle and tail samples '
+                  '(${formatBytes(estimate.sampleBytes)} total) and '
+                  'extrapolated — real ratios depend on the file.',
           style: theme.textTheme.bodySmall,
         ),
+        if (estimate.overCap) ...[
+          const SizedBox(height: 12),
+          Text(
+            EncodeController.capAdvice(estimate.estimatedFrames),
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: theme.colorScheme.error,
+            ),
+          ),
+        ],
       ],
     );
   }
