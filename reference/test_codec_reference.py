@@ -340,6 +340,16 @@ class CodeImageTests(unittest.TestCase):
         rows.reverse()
         self.assertEqual(mo.parse_barcode_rows(rows), raw)
 
+    def test_barcode_full_frame_roundtrip(self):
+        # A full 64 KiB frame needs 1,026 barcode rows; the 8-bit row
+        # index wraps at 256, so reassembly must fall back to list
+        # order (parity with the Dart fix in lib/codec/code_grid.dart).
+        frame = mo.encode(os.urandom(64 * 1024)).frames[0]
+        raw = frame.to_bytes()
+        rows = mo.build_barcode_rows(raw)
+        self.assertEqual(len(rows), 1026)
+        self.assertEqual(mo.parse_barcode_rows(rows), raw)
+
     def test_centre_tile_is_clear(self):
         grid = mo.build_grid(os.urandom(100))
         n = len(grid)

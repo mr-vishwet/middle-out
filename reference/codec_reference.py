@@ -680,13 +680,24 @@ def build_barcode_rows(payload: bytes) -> list[bytearray]:
 
 
 def parse_barcode_rows(rows: list[bytearray]) -> bytes:
-    """Inverse of build_barcode_rows. Rows are reassembled by their index."""
+    """Inverse of build_barcode_rows. Rows are reassembled by their index,
+    so a scan that reads them out of order still decodes.
+
+    The row index is 8 bits, so a frame needing more than 256 rows
+    (payload above ~16 KiB — every full 64 KiB frame needs 1,026 rows)
+    wraps: rows 256+ reuse indices 0+. When indices collide the index
+    cannot order the rows, so they are reassembled in list order
+    instead — PDF extraction and camera scans both read top-to-bottom,
+    so list order is the row order. Unique indices keep the old
+    index-ordered behaviour.
+    """
     if not rows:
         raise CodecError("no barcode rows")
     width = len(rows[0])
     if width != 4 + 8 + BARCODE_ROW_BYTES * 8 + 4:
         raise CodecError(f"unexpected barcode row width {width}")
     chunks: dict[int, bytes] = {}
+    ordered: list[bytes] = []
     for bars in rows:
         if list(bars[:4]) != [1, 1, 1, 1] or list(bars[-4:]) != [1, 1, 1, 1]:
             raise CodecError("barcode row guard pattern missing")
@@ -699,8 +710,15 @@ def parse_barcode_rows(rows: list[bytearray]) -> bytes:
             for bit in bars[12 + i * 8 : 20 + i * 8]:
                 byte = (byte << 1) | bit
             data.append(byte)
-        chunks[index] = bytes(data)
-    blob = b"".join(chunks[i] for i in sorted(chunks))
+        chunk = bytes(data)
+        chunks[index] = chunk
+        ordered.append(chunk)
+    if len(chunks) == len(rows):
+        # No index collision: reassemble by index (out-of-order scans OK).
+        blob = b"".join(chunks[i] for i in sorted(chunks))
+    else:
+        # Indices wrapped past 256 rows: reassemble in list order.
+        blob = b"".join(ordered)
     (length,) = struct.unpack(">I", blob[:4])
     if length + 4 > len(blob):
         raise CodecError("barcode length prefix exceeds payload")
