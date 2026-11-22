@@ -177,6 +177,79 @@ void main() {
     });
   });
 
+  group('encode retry after failure', () {
+    test('setting the passphrase after the missing-passphrase error '
+        'retries cleanly', () async {
+      final controller = EncodeController();
+      final unit = 'Middle Out retry test. '.codeUnits;
+      final bytes = Uint8List.fromList(
+        [for (var i = 0; i < 10; i++) ...unit],
+      );
+      controller.file = PickedRef(
+        name: 'note.txt',
+        size: bytes.length,
+        bytes: bytes,
+      );
+      controller.encrypted = true;
+      controller.passphrase = '';
+      controller.phase = EncodePhase.ready;
+      await controller.encode();
+      expect(controller.phase, EncodePhase.error);
+      expect(controller.error, contains('passphrase'));
+      // The live-app bug: the phase stayed at error, so re-entering the
+      // progress screen never started a new encode and every retry
+      // showed this first failure. Changing an input must clear it.
+      controller.setPassphrase('middle-out-test');
+      expect(controller.error, isNull);
+      expect(controller.phase, EncodePhase.ready);
+      await controller.encode();
+      expect(controller.phase, EncodePhase.done);
+      expect(controller.pdfBytes, isNotNull);
+    });
+
+    test('turning encryption off after the error also clears it', () async {
+      final controller = EncodeController();
+      final unit = 'Middle Out retry test. '.codeUnits;
+      final bytes = Uint8List.fromList(
+        [for (var i = 0; i < 10; i++) ...unit],
+      );
+      controller.file = PickedRef(
+        name: 'note.txt',
+        size: bytes.length,
+        bytes: bytes,
+      );
+      controller.encrypted = true;
+      controller.passphrase = '';
+      controller.phase = EncodePhase.ready;
+      await controller.encode();
+      expect(controller.phase, EncodePhase.error);
+      controller.setEncrypted(false);
+      expect(controller.error, isNull);
+      expect(controller.phase, EncodePhase.ready);
+      await controller.encode();
+      expect(controller.phase, EncodePhase.done);
+      expect(controller.pdfBytes, isNotNull);
+    });
+
+    test('encode is re-runnable from the error phase (Try again)', () async {
+      final controller = EncodeController(picker: _ThrowingPicker());
+      controller.file = PickedRef(
+        name: 'x.bin',
+        size: 100,
+        bytes: Uint8List(100),
+      );
+      controller.encrypted = false;
+      controller.phase = EncodePhase.ready;
+      await controller.encode();
+      expect(controller.phase, EncodePhase.error);
+      // Retrying directly (what the Try again button does) re-runs the
+      // encode instead of showing the stale error.
+      await controller.encode();
+      expect(controller.phase, EncodePhase.error);
+      expect(controller.error, contains('disk gone'));
+    });
+  });
+
   group('PDF theme toggle', () {
     test('pdfDark defaults to light and setPdfDark flips it', () {
       final controller = EncodeController();

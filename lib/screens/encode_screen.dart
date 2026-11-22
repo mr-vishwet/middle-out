@@ -416,7 +416,13 @@ class _EncodingScreenState extends State<EncodingScreen> {
     final controller = _controller!;
     controller.removeListener(_onPhaseChange);
     controller.addListener(_onPhaseChange);
-    if (!_started && controller.phase == EncodePhase.ready) {
+    // Start from ready — or from error: re-entering this screen after a
+    // failed encode is a retry (the user just fixed the input on the
+    // pre-encode screen). Starting only from ready left the phase stuck
+    // at error, so every retry showed the first failure's message at 0%.
+    if (!_started &&
+        (controller.phase == EncodePhase.ready ||
+            controller.phase == EncodePhase.error)) {
       _started = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         controller.encode();
@@ -513,6 +519,11 @@ class _EncodingScreenState extends State<EncodingScreen> {
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 16),
+                  FilledButton(
+                    onPressed: controller.encode,
+                    child: const Text('Try again'),
+                  ),
+                  const SizedBox(height: 8),
                   OutlinedButton(
                     onPressed: () => Navigator.of(context).pop(),
                     child: const Text('Back to pre-encode'),

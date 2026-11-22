@@ -233,25 +233,43 @@ class EncodeController extends ChangeNotifier {
   /// Sets the code format.
   void setBarcode(bool value) {
     barcode = value;
+    _clearStaleError();
     notifyListeners();
   }
 
   /// Sets the PDF theme (false = light, true = dark).
   void setPdfDark(bool value) {
     pdfDark = value;
+    _clearStaleError();
     notifyListeners();
   }
 
   /// Sets the encryption toggle.
   void setEncrypted(bool value) {
     encrypted = value;
+    _clearStaleError();
     notifyListeners();
   }
 
   /// Sets the passphrase.
   void setPassphrase(String value) {
     passphrase = value;
+    _clearStaleError();
     notifyListeners();
+  }
+
+  /// Clears a stale error when the user changes an option on the
+  /// pre-encode screen, so the flow is retryable: without this the phase
+  /// stays [EncodePhase.error] after a failed encode, the progress screen
+  /// never starts a new encode (it only starts from [EncodePhase.ready]),
+  /// and every retry shows the first failure's message — including the
+  /// red error text lingering on the pre-encode screen itself.
+  void _clearStaleError() {
+    if (phase != EncodePhase.error) return;
+    error = null;
+    phase = file != null ? EncodePhase.ready : EncodePhase.idle;
+    progress = 0;
+    progressLabel = '';
   }
 
   /// Opens the system picker (limit-gated) and refreshes the estimate.
