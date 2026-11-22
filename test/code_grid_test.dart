@@ -146,6 +146,18 @@ void main() {
       final rows = CodeGrid.buildBarcodeRows(raw).reversed.toList();
       expect(CodeGrid.parseBarcodeRows(rows), raw);
     });
+
+    test('full 64 KiB frame round-trips (row index wraps past 256)', () {
+      // A full frame needs 1,026 barcode rows; the 8-bit row index wraps
+      // at 256, so reassembly must fall back to list order.
+      final random = Random(9);
+      final raw = Uint8List.fromList(
+        List<int>.generate(64 * 1024, (_) => random.nextInt(256)),
+      );
+      final rows = CodeGrid.buildBarcodeRows(raw);
+      expect(rows.length, greaterThan(256));
+      expect(CodeGrid.parseBarcodeRows(rows), raw);
+    });
   });
 
   group('1-bit PNG encoder', () {

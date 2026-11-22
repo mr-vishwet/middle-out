@@ -15,8 +15,6 @@ dependencies:
   # zlib compression that works on mobile and web (dart:io ZLibCodec is
   # not available on web).
   archive: ^4.0.7
-  # Encoded-PDF assembly: 1 cover page + 1 full-page code page per frame.
-  pdf: ^3.11.3
   # File picking on mobile, desktop and web.
   file_picker: ^8.1.6
   # App documents directory for saving encoded PDFs on native platforms.

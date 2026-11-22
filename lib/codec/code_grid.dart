@@ -218,6 +218,14 @@ class CodeGrid {
 
   /// Inverse of [buildBarcodeRows]. Rows are reassembled by their index,
   /// so a scan that reads them out of order still decodes.
+  ///
+  /// The row index is 8 bits, so a frame needing more than 256 rows
+  /// (payload above ~16 KiB — every full 64 KiB frame needs 1,026 rows)
+  /// wraps: rows 256+ reuse indices 0+. When indices collide the index
+  /// cannot order the rows, so they are reassembled in list order
+  /// instead — PDF extraction and camera scans both read top-to-bottom,
+  /// so list order is the row order. Unique indices keep the old
+  /// index-ordered behaviour.
   static Uint8List parseBarcodeRows(List<Uint8List> rows) {
     if (rows.isEmpty) {
       throw const CodecException('no barcode rows');
@@ -228,6 +236,7 @@ class CodeGrid {
       );
     }
     final chunks = <int, Uint8List>{};
+    final ordered = <Uint8List>[];
     for (final bars in rows) {
       if (bars[0] != 1 ||
           bars[1] != 1 ||
@@ -252,11 +261,20 @@ class CodeGrid {
         data[i] = byte;
       }
       chunks[index] = data;
+      ordered.add(data);
     }
-    final sorted = chunks.keys.toList()..sort();
     final blob = BytesBuilder();
-    for (final index in sorted) {
-      blob.add(chunks[index]!);
+    if (chunks.length == rows.length) {
+      // No index collision: reassemble by index (out-of-order scans OK).
+      final sorted = chunks.keys.toList()..sort();
+      for (final index in sorted) {
+        blob.add(chunks[index]!);
+      }
+    } else {
+      // Indices wrapped past 256 rows: reassemble in list order.
+      for (final data in ordered) {
+        blob.add(data);
+      }
     }
     final bytes = blob.toBytes();
     final length = ByteData.sublistView(bytes, 0, 4).getUint32(0);
