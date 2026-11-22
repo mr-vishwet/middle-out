@@ -27,7 +27,9 @@ const int kFrameVersion = 2;
 ///  7       kind             0 = DATA, 1 = PARITY
 ///  8..9    groupIndex       which 8-frame group this frame belongs to (uint16)
 /// 10       slot             0..7 position inside its group (0-5 DATA, 6-7 PARITY)
-/// 11       flags            bit0 = encrypted, bit1 = last group, bit2 = barcode
+/// 11       flags            bit0 = encrypted, bit1 = last group,
+///                           bit2 = barcode, bit3 = equal split
+///                           (bits 4-7 reserved, must be zero)
 /// 12..13   totalGroups      number of 8-frame groups in the encode (uint16)
 /// 14..15   totalDataFrames  number of DATA frames in the encode (uint16)
 /// 16..19   payloadLength    bytes of payload in this frame (uint32)
@@ -73,14 +75,25 @@ const int kFlagLastGroup = 0x02;
 /// image parser itself auto-detects by aspect ratio.
 const int kFlagBarcode = 0x04;
 
-/// Frames per group: 6 DATA + 2 PARITY. Every group is exactly 8 frames so
-/// the encoded PDF layout is uniform (1 cover + 8 pages per group).
+/// Set on every frame of an equal-split encode: the compressed stream was
+/// divided into [kMaxDataPages] or fewer EQUAL chunks (the last chunk
+/// zero-padded to the chunk size) instead of fixed [kDefaultMaxPayload]
+/// chunks. The decoder derives the chunk size from the header
+/// (`ceil(compressedSize / totalDataFrames)`) and trims the reassembled
+/// stream to `compressedSize` before decrypt/decompress. Old frames lack
+/// this flag and keep the fixed-chunk derivation, so old PDFs still decode.
+const int kFlagEqualSplit = 0x08;
+
+/// Frames per group: up to 6 DATA + up to 2 PARITY. A trailing group
+/// whose second trio is empty emits no second parity frame (an empty
+/// parity would render as a near-blank code page), so groups are up to
+/// 8 frames, not exactly 8.
 const int kGroupDataFrames = 6;
 
 /// Parity frames per group (slots 6 and 7).
 const int kGroupParityFrames = 2;
 
-/// Total frames per group (data + parity).
+/// Total frames per group (data + parity) when both trios are present.
 const int kGroupSize = kGroupDataFrames + kGroupParityFrames;
 
 /// Parity slot 6 protects data slots 0, 1, 2; parity slot 7 protects
@@ -96,20 +109,31 @@ const int kParityASlot = 6;
 /// Group slot of the parity frame protecting [kParityBTrio].
 const int kParityBSlot = 7;
 
-/// Default maximum payload per frame (64 KiB). Sized for reliable scanning
-/// of a full-page code at print resolution — see README "Honest limits".
+/// Sizing unit for equal-split encodes (64 KiB) and the fixed chunk
+/// size for streaming encodes. The in-memory encoder divides the
+/// compressed stream into `min(kMaxDataPages, ceil(stream / unit))`
+/// equal chunks, so a frame holds up to ~50 MB on a 1 GB input — the
+/// grid cap ([CodeGrid.maxHeight]) sizes for that, not for 64 KiB.
 const int kDefaultMaxPayload = 65536;
+
+/// Maximum DATA frames (code pages) in an equal-split encode: the
+/// compressed stream is divided into at most this many equal chunks, so
+/// every code page is dense no matter the file size. A 1-data encode
+/// still yields 1 data frame; streaming encodes (which do not know the
+/// total upfront) use fixed [kDefaultMaxPayload] chunks instead and are
+/// not bound by this.
+const int kMaxDataPages = 20;
 
 /// Maximum frames in one encode.
 ///
 /// This is a policy guardrail, not a format limit: v2 widened frameIndex
 /// to uint16, so the format itself can address 65,535 frames, and this
-/// cap can be raised later without another format change. 4096 covers the
-/// 1 GB hero case (~300 frames) 13x over and the largest real-world
-/// report so far (a 67 MB mp4 needing 1,125 frames) 3.6x over, while
-/// bounding the PDF at ~250 MB (4,096 full-page codes) and in-memory
-/// frame payloads at ~256 MB. Beyond that the PDF itself is unusable, and
-/// the estimate screen warns before encoding starts.
+/// cap can be raised later without another format change. It binds the
+/// streaming path (fixed 64 KiB chunks: a 67 MB mp4 needs 1,125 frames)
+/// and hand-built frame sets; the in-memory equal-split path never comes
+/// close (at most [kMaxDataPages] data + 8 parity = 28 frames). Beyond
+/// 4,096 frames the PDF itself is unusable, and the estimate screen
+/// warns before encoding starts.
 const int kMaxFrames = 4096;
 
 /// ---------------------------------------------------------------------------

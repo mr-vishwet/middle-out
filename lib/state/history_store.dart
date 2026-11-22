@@ -54,7 +54,7 @@ class HistoryRecord {
   /// Frames in the encode (data + parity).
   final int frameCount;
 
-  /// 8-frame groups in the encode.
+  /// Parity groups in the encode (up to 8 frames each).
   final int groupCount;
 
   /// True when the frames were rendered as barcodes.

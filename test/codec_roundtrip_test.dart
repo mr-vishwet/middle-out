@@ -106,8 +106,9 @@ void main() {
         200,
       );
       final result = Encoder.encode(data);
-      // Highly compressible sample -> 1 DATA + 2 PARITY = 3 frames.
-      expect(result.frames.length, 3);
+      // Highly compressible sample -> 1 DATA + 1 PARITY = 2 frames
+      // (the second trio is empty, so no second parity is emitted).
+      expect(result.frames.length, 2);
       expect(result.stats.groupCount, 1);
       expect(
         Decoder.decode([for (final f in result.frames) f.toBytes()]),
@@ -132,6 +133,8 @@ void main() {
 
     test('empty file', () {
       final result = Encoder.encode(Uint8List(0));
+      // zlib of nothing is 8 bytes: 1 data frame + its parity.
+      expect(result.frames.length, 2);
       expect(
         Decoder.decode([for (final f in result.frames) f.toBytes()]),
         Uint8List(0),
@@ -267,31 +270,62 @@ void main() {
     });
 
     test('more than 256 frames round-trips (67 MB mp4 regression)', () {
-      // 13 MiB of incompressible data needs ~279 frames at the default
-      // 64 KiB payload — over the old 256 cap, under the 4096 cap.
+      // 13 MiB of incompressible data in FIXED 64 KiB chunks needs
+      // ~278 frames — over the old 256 cap, under the 4096 cap. Fixed
+      // chunks come from buildFrames directly now (the in-memory path
+      // equal-splits into at most 20 data frames); the streaming path
+      // still frames this way, and the v2 uint16 indices must hold.
       final random = Random(1234);
       final data = Uint8List(13 * 1024 * 1024);
       for (var i = 0; i < data.length; i++) {
         data[i] = random.nextInt(256);
       }
-      final result = Encoder.encode(data);
-      expect(result.frames.length, greaterThan(256));
-      expect(result.stats.frameCount, result.frames.length);
+      final compressed = Uint8List.fromList(
+        const ZLibEncoder().encode(data, level: 9),
+      );
+      final chunks = <Uint8List>[];
+      for (var i = 0; i < compressed.length; i += kDefaultMaxPayload) {
+        final end = min(i + kDefaultMaxPayload, compressed.length);
+        chunks.add(Uint8List.sublistView(compressed, i, end));
+      }
+      final frames = Encoder.buildFrames(
+        chunks: chunks,
+        sha256Bytes: Uint8List.fromList(sha256.convert(data).bytes),
+        originalSize: data.length,
+        compressedSize: compressed.length,
+        salt: Uint8List(kSaltLength),
+        nonce: Uint8List(kNonceLength),
+        encrypted: false,
+        barcode: false,
+      );
+      expect(frames.length, greaterThan(256));
+      // No equal-split flag on fixed-chunk frames: the decoder takes
+      // the old derivation path for them.
       expect(
-        Decoder.decode([for (final f in result.frames) f.toBytes()]),
+        frames.every((f) => f.flags & kFlagEqualSplit == 0),
+        isTrue,
+      );
+      expect(
+        Decoder.decode([for (final f in frames) f.toBytes()]),
         data,
       );
     });
 
     test('encode over the frame cap throws a clear error', () {
-      final random = Random(99);
-      final data = Uint8List(5 * 1024 * 1024);
-      for (var i = 0; i < data.length; i++) {
-        data[i] = random.nextInt(256);
-      }
-      // A 1 KiB payload forces ~6,800 frames out of 5 MiB.
+      // 5,000 fixed chunks need ~6,668 frames — over the 4,096 cap.
+      // buildFrames checks the cap before framing, so empty chunks
+      // exercise it cheaply.
       expect(
-        () => Encoder.encode(data, maxPayload: 1024),
+        () => Encoder.buildFrames(
+          chunks: List<Uint8List>.filled(5000, Uint8List(0)),
+          sha256Bytes: Uint8List(32),
+          originalSize: 0,
+          compressedSize: 0,
+          salt: Uint8List(16),
+          nonce: Uint8List(12),
+          encrypted: false,
+          barcode: false,
+        ),
         throwsA(
           isA<CodecException>().having(
             (e) => e.message,
@@ -299,6 +333,121 @@ void main() {
             allOf(contains('4096'), contains('Split')),
           ),
         ),
+      );
+    });
+  });
+
+  group('equal-split encode', () {
+    test('200 KiB random payload splits into 4 dense data pages', () {
+      final random = Random(7);
+      final data = Uint8List.fromList(
+        List<int>.generate(200 * 1024, (_) => random.nextInt(256)),
+      );
+      final result = Encoder.encode(data);
+      final dataFrames = [
+        for (final f in result.frames)
+          if (f.isData) f,
+      ];
+      expect(dataFrames.length, 4);
+      // All four carry the full chunk size — no sparse last page. The
+      // last chunk is zero-padded to chunkSize; the decoder trims the
+      // padding (the round-trip below proves it).
+      final chunkSize = (result.stats.compressedSize + 3) ~/ 4;
+      for (final frame in dataFrames) {
+        expect(frame.payload.length, chunkSize);
+      }
+      // Every frame carries the equal-split flag.
+      for (final frame in result.frames) {
+        expect(frame.flags & kFlagEqualSplit, kFlagEqualSplit);
+      }
+      // 4 data in one group: both trios non-empty, so both parities exist.
+      expect(result.frames.length, 6);
+      expect(
+        Decoder.decode([for (final f in result.frames) f.toBytes()]),
+        data,
+      );
+    });
+
+    test('small file: 1 data + 1 parity, no second parity', () {
+      final data = repeatedBytes('Middle Out small file. ', 10);
+      final result = Encoder.encode(data);
+      expect(result.frames.length, 2);
+      expect(
+        result.frames.where((f) => f.isData).length,
+        1,
+      );
+      expect(
+        result.frames.where((f) => f.isParity).length,
+        1,
+      );
+      expect(
+        result.frames.any((f) => f.slot == kParityBSlot),
+        isFalse,
+      );
+      expect(
+        Decoder.decode([for (final f in result.frames) f.toBytes()]),
+        data,
+      );
+    });
+
+    test('buildFrames with no chunks: 1 empty data frame, no parity', () {
+      // The empty-input edge: no empty parity frame is emitted (an
+      // empty parity would render as a near-blank code page).
+      final frames = Encoder.buildFrames(
+        chunks: <Uint8List>[],
+        sha256Bytes: Uint8List(32),
+        originalSize: 0,
+        compressedSize: 0,
+        salt: Uint8List(16),
+        nonce: Uint8List(12),
+        encrypted: false,
+        barcode: false,
+      );
+      expect(frames.length, 1);
+      expect(frames.first.isData, isTrue);
+      expect(frames.first.payload.length, 0);
+    });
+
+    test('5 MB single frame round-trips (equal split, one page)', () {
+      // A 5 MB payload with a large unit splits into ONE ~5 MB frame —
+      // the big-frame shape the grid cap sizes for.
+      final random = Random(11);
+      final data = Uint8List.fromList(
+        List<int>.generate(5 * 1024 * 1024, (_) => random.nextInt(256)),
+      );
+      final result = Encoder.encode(data, maxPayload: 8 * 1024 * 1024);
+      expect(
+        result.frames.where((f) => f.isData).length,
+        1,
+      );
+      expect(
+        result.frames.first.payload.length,
+        greaterThan(5 * 1024 * 1024),
+      );
+      expect(
+        Decoder.decode([for (final f in result.frames) f.toBytes()]),
+        data,
+      );
+    });
+
+    test('20 data pages max, however large the file', () {
+      // 2 MiB of random data would need 32 fixed chunks — equal-split
+      // caps it at 20 dense data frames.
+      final random = Random(13);
+      final data = Uint8List.fromList(
+        List<int>.generate(2 * 1024 * 1024, (_) => random.nextInt(256)),
+      );
+      final result = Encoder.encode(data);
+      expect(
+        result.frames.where((f) => f.isData).length,
+        20,
+      );
+      expect(result.stats.groupCount, 4);
+      // 3 full groups (2 parities each) + a 2-data group (1 parity).
+      expect(result.frames.length, 27);
+      expect(
+        Decoder.decode([for (final f in result.frames) f.toBytes()]),
+        data,
       );
     });
   });

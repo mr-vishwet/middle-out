@@ -76,4 +76,57 @@ void main() {
     expect(blobs.length, 6);
     expect(Decoder.decode(blobs), data);
   });
+
+  test('1-data group: lose the only data frame, parity rebuilds it', () {
+    // Small file: 1 data + 1 parity, no second parity (empty trio).
+    final data = Uint8List.fromList(
+      'Middle Out one-frame group. '.codeUnits,
+    );
+    final result = Encoder.encode(data);
+    expect(result.frames.length, 2);
+    expect(
+      result.frames.any((f) => f.slot == kParityBSlot),
+      isFalse,
+    );
+    // Drop the data frame — only the parity remains.
+    final parityOnly = [
+      for (final f in result.frames)
+        if (f.isParity) f.toBytes(),
+    ];
+    expect(Decoder.decode(parityOnly), data);
+  });
+
+  test('1-data group: lose the only parity frame is fine', () {
+    final data = Uint8List.fromList(
+      'Middle Out one-frame group, parity lost. '.codeUnits,
+    );
+    final result = Encoder.encode(data);
+    expect(result.frames.length, 2);
+    // Drop the parity frame — the data frame alone decodes. The
+    // decoder's missing-parity path is never hit: the empty trio has
+    // nothing missing, so it continues.
+    final dataOnly = [
+      for (final f in result.frames)
+        if (f.isData) f.toBytes(),
+    ];
+    expect(Decoder.decode(dataOnly), data);
+  });
+
+  test('equal-split: lose a middle frame, parity rebuilds it', () {
+    // 200 KiB random -> 4 dense data frames + 2 parity. Losing data
+    // frame 1 (trio A) must rebuild to the exact chunk size.
+    final random = Random(7);
+    final data = Uint8List.fromList(
+      List<int>.generate(200 * 1024, (_) => random.nextInt(256)),
+    );
+    final result = Encoder.encode(data);
+    expect(result.frames.where((f) => f.isData).length, 4);
+    final blobs = blobsOf(result);
+    // Frame list order is group order: data frames first.
+    final kept = [
+      for (var i = 0; i < blobs.length; i++)
+        if (i != 1) blobs[i],
+    ];
+    expect(Decoder.decode(kept), data);
+  });
 }

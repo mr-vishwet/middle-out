@@ -1,3 +1,4 @@
+import 'dart:math' show min;
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
@@ -14,6 +15,13 @@ import 'frame.dart';
 /// where possible. Throws [UnrecoverableException] when a parity trio lost
 /// two or more frames, [VerificationException] when the rebuilt bytes fail
 /// the SHA-256 / size check (wrong passphrase, tampered payload).
+///
+/// Two chunkings are understood, told apart by [kFlagEqualSplit]:
+/// equal-split frames are all one chunk size (`ceil(compressedSize /
+/// totalDataFrames)`, last zero-padded — the reassembled stream is
+/// trimmed to `compressedSize` before decrypt/decompress), while old
+/// fixed-chunk frames derive the chunk size from a present non-last data
+/// frame. Old PDFs (no flag) decode exactly as before.
 class Decoder {
   static int _expectedDataLength(
     int frameIndex,
@@ -51,20 +59,30 @@ class Decoder {
     final totalData = meta.totalDataFrames;
     final totalGroups = meta.totalGroups;
     final compressedSize = meta.compressedSize;
+    final equalSplit = meta.flags & kFlagEqualSplit != 0;
 
-    // Derive maxPayload from any present non-last data frame.
-    var maxPayload = kDefaultMaxPayload;
-    var found = false;
-    for (final frame in frames) {
-      if (frame.isData &&
-          !frame.payloadCorrupt &&
-          frame.frameIndex < totalData - 1) {
-        maxPayload = frame.payload.length;
-        found = true;
-        break;
+    // The per-frame chunk size. Equal-split encodes derive it from the
+    // header alone; fixed-chunk encodes derive it from any present
+    // non-last data frame.
+    final int maxPayload;
+    if (equalSplit) {
+      final safeTotal = totalData < 1 ? 1 : totalData;
+      maxPayload = (compressedSize + safeTotal - 1) ~/ safeTotal;
+    } else {
+      var derived = kDefaultMaxPayload;
+      var found = false;
+      for (final frame in frames) {
+        if (frame.isData &&
+            !frame.payloadCorrupt &&
+            frame.frameIndex < totalData - 1) {
+          derived = frame.payload.length;
+          found = true;
+          break;
+        }
       }
+      if (!found && totalData == 1) derived = compressedSize;
+      maxPayload = derived;
     }
-    if (!found && totalData == 1) maxPayload = compressedSize;
 
     // Valid frames by (group, slot); corrupt payloads are treated as lost.
     final valid = <(int, int), Frame>{};
@@ -141,6 +159,20 @@ class Decoder {
       stream.add(frame.payload);
     }
 
+    // The reassembled stream, trimmed to compressedSize: equal-split
+    // encodes zero-pad the last chunk to the chunk size, and the
+    // padding must come off before decrypt/decompress (zlib rejects
+    // trailing bytes). Fixed-chunk encodes reassemble to exactly
+    // compressedSize, so the trim is a no-op for them. A short stream
+    // (a frame lost without parity) is left short — the size check
+    // below reports it instead of a RangeError here.
+    final reassembled = stream.toBytes();
+    final streamBytes = Uint8List.sublistView(
+      reassembled,
+      0,
+      min(reassembled.length, compressedSize),
+    );
+
     final Uint8List data;
     try {
       if (meta.isEncrypted) {
@@ -150,10 +182,10 @@ class Decoder {
           );
         }
         final key = deriveKey(passphrase, meta.salt);
-        final plain = ChaCha20.xor(key, meta.nonce, stream.toBytes());
+        final plain = ChaCha20.xor(key, meta.nonce, streamBytes);
         data = Uint8List.fromList(const ZLibDecoder().decodeBytes(plain));
       } else {
-        data = Uint8List.fromList(const ZLibDecoder().decodeBytes(stream.toBytes()));
+        data = Uint8List.fromList(const ZLibDecoder().decodeBytes(streamBytes));
       }
     } on VerificationException {
       rethrow;

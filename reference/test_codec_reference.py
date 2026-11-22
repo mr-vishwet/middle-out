@@ -4,12 +4,17 @@
 Run:  python3 test_codec_reference.py
 
 Covers: ChaCha20 RFC 8439 vector, encode/decode round-trip (plain +
-encrypted, grid + barcode), parity recovery (one lost frame per trio),
-failure modes (two lost in a trio, wrong passphrase, tampered payload),
-rectangular grid geometry (capacity formula proven against an
-independent count), grid/bar-grid image round-trips, polarity detection,
-and full PDF build + decode-back (light/dark x QR/barcode, full 64 KiB
-frames, plus the golden old-format fixtures).
+encrypted, grid + barcode), equal-split framing (20-frame cap, zero-
+padded last chunk, parity only for non-empty trios, 1-data-group
+recovery, old-format fixed-chunk frames still decoding), parity
+recovery (one lost frame per trio), failure modes (two lost in a trio,
+wrong passphrase, tampered payload), rectangular grid geometry
+(capacity formula proven against an independent count), grid/bar-grid
+image round-trips, polarity detection, the cover QR const (finder
+patterns, quiet zone, cv2 decode to the app URL), and full PDF build +
+decode-back (light/dark x QR/barcode, branded landscape cover with
+details only, cover-stripped and coverless PDFs still decoding, plus
+the golden old-format fixtures and the Dart-built samples).
 """
 
 import hashlib
@@ -110,8 +115,9 @@ class RoundTripTests(unittest.TestCase):
     def test_plain_roundtrip(self):
         data = _sample_text()
         result = mo.encode(data)
-        # Highly compressible sample -> 1 DATA frame + 2 PARITY = 3 frames.
-        self.assertEqual(len(result.frames), 3)
+        # Highly compressible sample -> 1 DATA frame + P1 only (trio B
+        # is empty, so there is no P2) = 2 frames.
+        self.assertEqual(len(result.frames), 2)
         self.assertEqual(result.stats.group_count, 1)
         self.assertEqual(mo.decode([f.to_bytes() for f in result.frames]), data)
 
@@ -132,7 +138,18 @@ class RoundTripTests(unittest.TestCase):
         self.assertEqual(mo.decode([f.to_bytes() for f in result.frames]), data)
 
     def test_empty_file(self):
-        self.assertEqual(mo.decode([f.to_bytes() for f in mo.encode(b"").frames]), b"")
+        result = mo.encode(b"")
+        # Empty input compresses to an 8-byte zlib stream: 1 data frame
+        # + P1, no P2 (trio B empty).
+        self.assertEqual(len(result.frames), 2)
+        self.assertEqual(
+            [(f.kind, f.slot) for f in result.frames],
+            [(mo.KIND_DATA, 0), (mo.KIND_PARITY, mo.PARITY_A_SLOT)],
+        )
+        self.assertEqual(mo.decode([f.to_bytes() for f in result.frames]), b"")
+        # The 0-byte stream edge itself: one empty chunk, and parity of
+        # nothing is nothing — no parity frame is emitted for it.
+        self.assertEqual(mo._split_equal(b"", mo.DEFAULT_MAX_PAYLOAD), [b""])
 
     def test_random_data_multi_group(self):
         # Incompressible data forces several groups; use a small payload so
@@ -212,23 +229,289 @@ class RoundTripTests(unittest.TestCase):
         ]
         self.assertEqual(mo.decode(blobs), data)
 
-    def test_more_than_256_frames_roundtrip(self):
-        # 13 MiB of incompressible data needs ~279 frames at the default
-        # 64 KiB payload — over the old 256 cap, under the 4096 cap.
+    def test_large_file_caps_at_twenty_data_frames(self):
+        # Equal-split caps an encode at 20 data frames: 13 MiB of
+        # incompressible data splits into 20 equal ~682 KiB chunks
+        # (plus parity), NOT ~208 fixed 64 KiB frames — every code page
+        # is equally dense. (The old >256-frame test is obsolete: the
+        # cap makes it unreachable through encode(); uint16 indices
+        # above 255 are still covered by
+        # test_v2_header_roundtrips_indices_above_255.)
         data = os.urandom(13 * 1024 * 1024)
         result = mo.encode(data)
-        self.assertGreater(len(result.frames), 256)
+        data_frames = [f for f in result.frames if f.is_data]
+        self.assertEqual(len(data_frames), 20)
+        chunk_size = (result.stats.compressed_size + 19) // 20
+        self.assertTrue(all(len(f.payload) == chunk_size for f in data_frames))
         self.assertEqual(
             mo.decode([f.to_bytes() for f in result.frames]), data
         )
 
-    def test_over_cap_raises(self):
-        # A 1 KiB payload forces ~6,800 frames out of 5 MiB.
+    def test_small_max_payload_still_caps_at_twenty(self):
+        # Even a 1 KiB max_payload cannot force more than 20 data
+        # frames: the cap, not the payload size, bounds the frame count.
+        # (The old over-cap test is obsolete for the same reason.)
         data = os.urandom(5 * 1024 * 1024)
-        with self.assertRaises(mo.CodecError) as ctx:
-            mo.encode(data, max_payload=1024)
-        self.assertIn("4096", str(ctx.exception))
-        self.assertIn("Split", str(ctx.exception))
+        result = mo.encode(data, max_payload=1024)
+        data_frames = [f for f in result.frames if f.is_data]
+        self.assertEqual(len(data_frames), 20)
+        self.assertEqual(
+            mo.decode([f.to_bytes() for f in result.frames]), data
+        )
+
+
+def _old_style_encode(data, max_payload=mo.DEFAULT_MAX_PAYLOAD):
+    """Hand-build frames the OLD way (fixed <= max_payload chunks, last
+    frame short, NO equal-split flag, both parity frames always emitted
+    — even an empty P2) so the decoder's legacy path can be tested.
+    The encoder never writes this format any more."""
+    sha = hashlib.sha256(data).digest()
+    stream = zlib.compress(data, 9)
+    chunks = [stream[i : i + max_payload] for i in range(0, len(stream), max_payload)]
+    if not chunks:
+        chunks = [b""]
+    total_data = len(chunks)
+    total_groups = (total_data + mo.GROUP_DATA_FRAMES - 1) // mo.GROUP_DATA_FRAMES
+    frames = []
+    for group in range(total_groups):
+        group_chunks = chunks[
+            group * mo.GROUP_DATA_FRAMES : (group + 1) * mo.GROUP_DATA_FRAMES
+        ]
+        group_flags = mo.FLAG_LAST_GROUP if group == total_groups - 1 else 0
+        for slot, chunk in enumerate(group_chunks):
+            frames.append(
+                mo.Frame(
+                    frame_index=group * mo.GROUP_DATA_FRAMES + slot,
+                    kind=mo.KIND_DATA,
+                    group_index=group,
+                    slot=slot,
+                    flags=group_flags,
+                    total_groups=total_groups,
+                    total_data_frames=total_data,
+                    original_size=len(data),
+                    compressed_size=len(stream),
+                    original_sha256=sha,
+                    salt=bytes(16),
+                    nonce=bytes(12),
+                    payload=chunk,
+                )
+            )
+        for trio, parity_slot in (
+            (mo.PARITY_A_TRIO, mo.PARITY_A_SLOT),
+            (mo.PARITY_B_TRIO, mo.PARITY_B_SLOT),
+        ):
+            present = [group_chunks[s] for s in trio if s < len(group_chunks)]
+            if present:
+                width = max(len(c) for c in present)
+                parity = bytes(width)
+                for chunk in present:
+                    parity = bytes(
+                        x ^ y for x, y in zip(parity, chunk + bytes(width - len(chunk)))
+                    )
+            else:
+                parity = b""
+            frames.append(
+                mo.Frame(
+                    frame_index=total_data
+                    + group * mo.GROUP_PARITY_FRAMES
+                    + (parity_slot - mo.PARITY_A_SLOT),
+                    kind=mo.KIND_PARITY,
+                    group_index=group,
+                    slot=parity_slot,
+                    flags=group_flags,
+                    total_groups=total_groups,
+                    total_data_frames=total_data,
+                    original_size=len(data),
+                    compressed_size=len(stream),
+                    original_sha256=sha,
+                    salt=bytes(16),
+                    nonce=bytes(12),
+                    payload=parity,
+                )
+            )
+    return frames
+
+
+class EqualSplitTests(unittest.TestCase):
+    def test_equal_split_chunking(self):
+        # 200 KiB of random data: N = ceil(compressed/65536) = 4 equal
+        # chunks of ceil(compressed/4); the last is padded to the same
+        # width, so all four data payloads are equal.
+        data = os.urandom(200_000)
+        result = mo.encode(data)
+        data_frames = [f for f in result.frames if f.is_data]
+        self.assertEqual(len(data_frames), 4)
+        chunk_size = (result.stats.compressed_size + 3) // 4
+        self.assertTrue(all(len(f.payload) == chunk_size for f in data_frames))
+        # The flag is set on EVERY frame, data and parity alike.
+        self.assertTrue(all(f.is_equal_split for f in result.frames))
+        # The last chunk really is zero-padded (not short).
+        last = data_frames[-1]
+        real = result.stats.compressed_size - chunk_size * 3
+        self.assertEqual(last.payload[real:], bytes(chunk_size - real))
+        self.assertEqual(mo.decode([f.to_bytes() for f in result.frames]), data)
+
+    def test_equal_split_multi_page_roundtrip(self):
+        # 1 MiB random -> 17 data frames in 3 groups (6+6+5), 6 parity
+        # frames: every group has both trios non-empty, so P2 exists
+        # in all three groups. (N is computed from the actual
+        # compressed size — stored-block overhead pushes 1 MiB of
+        # random data just past 16 x 64 KiB.)
+        data = os.urandom(1024 * 1024)
+        result = mo.encode(data)
+        data_frames = [f for f in result.frames if f.is_data]
+        parity_frames = [f for f in result.frames if not f.is_data]
+        expect_n = min(
+            20,
+            (result.stats.compressed_size + mo.DEFAULT_MAX_PAYLOAD - 1)
+            // mo.DEFAULT_MAX_PAYLOAD,
+        )
+        self.assertEqual(len(data_frames), expect_n)
+        self.assertEqual(result.stats.group_count, 3)
+        self.assertEqual(len(parity_frames), 6)
+        self.assertEqual(len(result.frames), expect_n + 6)
+        self.assertEqual(mo.decode([f.to_bytes() for f in result.frames]), data)
+
+    def test_single_page_small_file(self):
+        # A small file is 1 data frame + P1 only: trio B has no data
+        # slot, so P2 is ABSENT (the old encoder always emitted an
+        # empty P2 — that sparse page is gone).
+        data = _sample_text(3)
+        result = mo.encode(data)
+        self.assertEqual(len(result.frames), 2)
+        self.assertEqual(
+            [(f.kind, f.slot) for f in result.frames],
+            [(mo.KIND_DATA, 0), (mo.KIND_PARITY, mo.PARITY_A_SLOT)],
+        )
+        self.assertEqual(mo.decode([f.to_bytes() for f in result.frames]), data)
+
+    def test_three_data_frames_have_no_p2(self):
+        # Exactly 3 data frames fill trio A and leave trio B empty:
+        # P1 yes, P2 no.
+        data = os.urandom(3 * mo.DEFAULT_MAX_PAYLOAD - 10_000)
+        result = mo.encode(data)
+        data_frames = [f for f in result.frames if f.is_data]
+        self.assertEqual(len(data_frames), 3)
+        self.assertEqual(len(result.frames), 4)  # 3 data + P1
+        self.assertEqual(
+            sorted(f.slot for f in result.frames if not f.is_data),
+            [mo.PARITY_A_SLOT],
+        )
+        self.assertEqual(mo.decode([f.to_bytes() for f in result.frames]), data)
+
+    def test_lose_padded_last_frame_recovers(self):
+        # Dropping the last (zero-padded) data frame must rebuild it
+        # and trim it to its true short length — the padded bytes must
+        # never reach the decompressor.
+        data = os.urandom(200_000)
+        result = mo.encode(data)
+        blobs = [
+            f.to_bytes()
+            for f in result.frames
+            if not (f.is_data and f.frame_index == 3)
+        ]
+        self.assertEqual(mo.decode(blobs), data)
+
+    def test_one_data_group_parity_recovery(self):
+        # 1 data frame + P1: losing the only data frame rebuilds from
+        # parity (the 1-data group case).
+        data = _sample_text(10)
+        result = mo.encode(data)
+        self.assertEqual(len(result.frames), 2)
+        blobs = [f.to_bytes() for f in result.frames if not f.is_data]
+        self.assertEqual(mo.decode(blobs), data)
+
+    def test_old_format_fixed_chunks_still_decode(self):
+        # Old-format frames (fixed 64 KiB chunks, short last frame, NO
+        # equal-split flag, empty P2 emitted) still decode through the
+        # legacy derivation — including parity recovery of the short
+        # last frame.
+        data = os.urandom(200_000)
+        frames = _old_style_encode(data)
+        self.assertEqual(len([f for f in frames if f.is_data]), 4)
+        self.assertFalse(any(f.is_equal_split for f in frames))
+        self.assertEqual(mo.decode([f.to_bytes() for f in frames]), data)
+        # Drop the short last data frame: the old derivation
+        # (max_payload from a non-last frame) must rebuild it.
+        blobs = [
+            f.to_bytes()
+            for f in frames
+            if not (f.is_data and f.frame_index == 3)
+        ]
+        self.assertEqual(mo.decode(blobs), data)
+
+    def test_big_frame_grid_roundtrip(self):
+        # A 5 MB frame (the equal-split scale: a 100 MB file splits
+        # into ~5 MB frames) builds and parses through the raised
+        # 32768 grid cap. Timed — the build time is reported, not
+        # asserted, so a slow machine fails loudly by timeout instead
+        # of silently passing on a small grid.
+        import time
+
+        raw = os.urandom(5 * 1024 * 1024)
+        t0 = time.time()
+        grid = mo.build_grid(raw)
+        build_s = time.time() - t0
+        w, h = len(grid[0]), len(grid)
+        self.assertLessEqual(h, mo.GRID_MAX_HEIGHT)
+        print(f"\n5 MB frame grid {w}x{h}, build {build_s:.1f}s")
+        t0 = time.time()
+        self.assertEqual(mo.parse_grid(grid), raw)
+        print(f"5 MB frame grid parse {time.time() - t0:.1f}s")
+
+
+class CoverQrTests(unittest.TestCase):
+    def test_cover_qr_const_finders(self):
+        # The const unpacks to a 29x29 module matrix with the three
+        # 7x7 finder patterns (outer ring black, middle ring white,
+        # 3x3 core black) in the right corners.
+        grid = mo.cover_qr_grid()
+        self.assertEqual(len(grid), mo.COVER_QR_SIZE)
+        self.assertTrue(all(len(row) == mo.COVER_QR_SIZE for row in grid))
+        self.assertEqual(len(mo.COVER_QR_MODULES), 106)
+        for r0, c0 in ((0, 0), (0, 22), (22, 0)):
+            for dr in range(7):
+                for dc in range(7):
+                    on_ring = dr in (0, 6) or dc in (0, 6)
+                    in_core = 2 <= dr <= 4 and 2 <= dc <= 4
+                    self.assertEqual(
+                        grid[r0 + dr][c0 + dc],
+                        1 if (on_ring or in_core) else 0,
+                        f"finder cell {(dr, dc)} at {(r0, c0)}",
+                    )
+
+    def test_cover_qr_quiet_zone(self):
+        # The drawn QR carries a >= 4-module white quiet zone on every
+        # side (37x37 at the default 4) — a QR without one fails to
+        # scan.
+        grid = mo.cover_qr_grid_with_quiet()
+        n = mo.COVER_QR_SIZE + 2 * mo.COVER_QR_QUIET_MODULES
+        self.assertEqual((len(grid[0]), len(grid)), (n, n))
+        q = mo.COVER_QR_QUIET_MODULES
+        for r in range(n):
+            for c in range(n):
+                if r < q or r >= n - q or c < q or c >= n - q:
+                    self.assertEqual(grid[r][c], 0, f"quiet-zone cell {(r, c)}")
+
+    def test_cover_qr_decodes_to_app_url(self):
+        # The const is a REAL ISO QR code for the app site, verified
+        # with cv2's QRCodeDetector when it is installed.
+        try:
+            import cv2
+            import numpy as np
+        except ImportError:
+            self.skipTest("cv2 not installed")
+        grid = mo.cover_qr_grid_with_quiet()
+        # Render at 8 px/module so the detector has real pixels.
+        scale = 8
+        n = len(grid) * scale
+        img = np.full((n, n), 255, dtype=np.uint8)
+        for r, row in enumerate(grid):
+            for c, v in enumerate(row):
+                if v:
+                    img[r * scale : (r + 1) * scale, c * scale : (c + 1) * scale] = 0
+        data, _points, _straight = cv2.QRCodeDetector().detectAndDecode(img)
+        self.assertEqual(data, mo.COVER_QR_URL)
 
 
 class ParityTests(unittest.TestCase):
@@ -489,6 +772,29 @@ class GeometryTests(unittest.TestCase):
             self.assertLess(sc + tw, w - 8)
 
 
+def _full_frame_bytes() -> bytes:
+    """Serialise one frame with a full 64 KiB payload, built directly
+    (encode() equal-splits now, so it no longer yields a 64 KiB frame
+    from a 64 KiB input). Header fields are arbitrary — only the
+    65,640-byte wire length matters for the grid-size pins."""
+    frame = mo.Frame(
+        frame_index=0,
+        kind=mo.KIND_DATA,
+        group_index=0,
+        slot=0,
+        flags=mo.FLAG_EQUAL_SPLIT,
+        total_groups=1,
+        total_data_frames=1,
+        original_size=65536,
+        compressed_size=65536,
+        original_sha256=bytes(32),
+        salt=bytes(16),
+        nonce=bytes(12),
+        payload=os.urandom(65536),
+    )
+    return frame.to_bytes()
+
+
 class CodeImageTests(unittest.TestCase):
     def test_grid_image_roundtrip(self):
         data = _sample_text(10)
@@ -520,16 +826,17 @@ class CodeImageTests(unittest.TestCase):
         self.assertEqual(mo.parse_grid(grid), raw)
 
     def test_barcode_grid_full_frame_roundtrip(self):
-        frame = mo.encode(os.urandom(64 * 1024)).frames[0]
-        raw = frame.to_bytes()
+        # A full 64 KiB frame, built directly: encode() no longer
+        # produces 64 KiB frames for a 64 KiB input (equal-split
+        # halves it), but the pinned 1776x314 bar-grid size must stay.
+        raw = _full_frame_bytes()
         self.assertEqual(len(raw), 65640)  # a full 64 KiB frame
         grid = mo.build_barcode_grid(raw)
         self.assertEqual((len(grid[0]), len(grid)), (1776, 314))
         self.assertEqual(mo.parse_grid(grid), raw)
 
     def test_grid_full_frame_roundtrip(self):
-        frame = mo.encode(os.urandom(64 * 1024)).frames[0]
-        raw = frame.to_bytes()
+        raw = _full_frame_bytes()
         grid = mo.build_grid(raw)
         self.assertEqual((len(grid[0]), len(grid)), (885, 626))
         self.assertEqual(mo.parse_grid(grid), raw)
@@ -552,8 +859,7 @@ class CodeImageTests(unittest.TestCase):
         # A full 64 KiB frame needs 1,026 barcode rows; the 8-bit row
         # index wraps at 256, so reassembly must fall back to list
         # order (parity with the Dart fix in lib/codec/code_grid.dart).
-        frame = mo.encode(os.urandom(64 * 1024)).frames[0]
-        raw = frame.to_bytes()
+        raw = _full_frame_bytes()
         rows = mo.build_barcode_rows(raw)
         self.assertEqual(len(rows), 1026)
         self.assertEqual(mo.parse_barcode_rows(rows), raw)
@@ -630,12 +936,12 @@ class PdfTests(unittest.TestCase):
             pdf_path = os.path.join(tmp, "out.pdf")
             stats = mo.build_pdf(result, "demo.txt", pdf_path)
             self.assertEqual(stats.pages, 1 + len(result.frames))
-            self.assertEqual(stats.frames, 3)  # 1 DATA + 2 PARITY
+            self.assertEqual(stats.frames, 2)  # 1 DATA + P1 (no P2)
             with open(pdf_path, "rb") as fh:
                 pdf_bytes = fh.read()
-            # Structural check: the PDF really has 4 pages.
+            # Structural check: the PDF really has 3 pages.
             pages = len(re.findall(rb"/Type\s*/Page[^s]", pdf_bytes))
-            self.assertEqual(pages, 4)
+            self.assertEqual(pages, 3)
             # Full loop: PDF -> images -> frames -> original bytes.
             self.assertEqual(mo.decode_pdf(pdf_path, "pdf-passphrase"), data)
 
@@ -645,12 +951,13 @@ class PdfTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             pdf_path = os.path.join(tmp, "out-bc.pdf")
             stats = mo.build_pdf(result, "demo.txt", pdf_path)
-            self.assertEqual(stats.pages, 4)  # 1 cover + 3 frames
+            self.assertEqual(stats.pages, 3)  # 1 cover + 2 frames
             self.assertEqual(mo.decode_pdf(pdf_path), data)
 
     def test_pdf_full_bleed_structure(self):
-        # Code pages are landscape with the image over the whole rect;
-        # the cover stays portrait; every frame page carries the RGB logo.
+        # ALL pages are landscape now — the cover is a branded
+        # landscape page too. Code pages carry the image over the
+        # whole rect; every page carries the RGB logo.
         data = _sample_text(10)
         result = mo.encode(data)
         with tempfile.TemporaryDirectory() as tmp:
@@ -659,24 +966,65 @@ class PdfTests(unittest.TestCase):
             with open(pdf_path, "rb") as fh:
                 pdf_bytes = fh.read()
         mediaboxes = re.findall(rb"/MediaBox \[[^\]]*\]", pdf_bytes)
-        self.assertEqual(mediaboxes[0], b"/MediaBox [0 0 595.28 841.89]")  # cover
-        for box in mediaboxes[1:]:
-            self.assertEqual(box, b"/MediaBox [0 0 841.89 595.28]")  # code pages
+        self.assertEqual(len(mediaboxes), 3)
+        for box in mediaboxes:
+            self.assertEqual(box, b"/MediaBox [0 0 841.89 595.28]")
         # The code image is drawn over the entire 841.89 x 595.28 rect.
         operators = b"\n".join(_pdf_content_streams(pdf_bytes))
-        self.assertEqual(operators.count(b"841.89 0 0 595.28 0 0 cm /Im0 Do"), 3)
-        # No caption text on code pages: the only text operators are the
-        # cover's (title + subtitle + 8 manifest lines = 10).
-        self.assertEqual(operators.count(b" Tj ET"), 10)
-        # One 1-bit code image per frame page + ONE shared 64x64 RGB logo.
+        self.assertEqual(operators.count(b"841.89 0 0 595.28 0 0 cm /Im0 Do"), 2)
+        # No caption text on code pages: the only text operators are
+        # the cover's (wordmark + 5 detail lines = 6).
+        self.assertEqual(operators.count(b" Tj ET"), 6)
+        # One 1-bit code image per frame page + the cover QR (37x37
+        # with its quiet zone) + ONE shared 64x64 RGB logo.
         self.assertEqual(pdf_bytes.count(b"/BitsPerComponent 1 /ColorSpace /DeviceGray"), 3)
+        self.assertEqual(
+            pdf_bytes.count(b"/Width 37 /Height 37 /BitsPerComponent 1"),
+            1,
+        )
         self.assertEqual(
             pdf_bytes.count(b"/Width 64 /Height 64 /BitsPerComponent 8 /ColorSpace /DeviceRGB"),
             1,
         )
-        # The logo is drawn once per frame page, inside a rounded-rect clip.
+        # The logo is drawn once per page (cover + frames), inside a
+        # rounded-rect clip.
         self.assertEqual(operators.count(b"/Im1 Do"), 3)
         self.assertEqual(operators.count(b"h W n"), 3)
+        # The QR is drawn once, on the cover.
+        self.assertEqual(operators.count(b"/ImQR Do"), 1)
+
+    def test_pdf_cover_has_details_only(self):
+        # The cover carries branding + simple details and NOTHING else:
+        # no SHA-256, no encoded payload size, no ratio, no frame or
+        # group counts, no decode instructions, no manifest grid.
+        data = _sample_text(10)
+        result = mo.encode(data)
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = os.path.join(tmp, "out.pdf")
+            mo.build_pdf(result, "demo.txt", pdf_path)
+            pdf_bytes = open(pdf_path, "rb").read()
+        operators = b"\n".join(_pdf_content_streams(pdf_bytes))
+        for wanted in (
+            b"(MIDDLE OUT)",
+            b"(File: demo.txt)",
+            b"(Original size: 960 bytes)",
+            b"(Format: QR-style grid)",
+            b"(Theme: Light)",
+            b"(Pages: 3)",
+        ):
+            self.assertIn(wanted, operators)
+        for banned in (
+            b"SHA-256",
+            result.stats.sha256_hex.encode("ascii"),
+            b"Encoded payload",
+            b"Ratio",
+            b"Frames:",
+            b"group(s)",
+            b"Decode with",
+            b"scan the frames",
+        ):
+            self.assertNotIn(banned, operators)
+            self.assertNotIn(banned, pdf_bytes)
 
     def test_pdf_dark_pages_have_black_background(self):
         data = _sample_text(5)
@@ -686,10 +1034,28 @@ class PdfTests(unittest.TestCase):
             dark = os.path.join(tmp, "dark.pdf")
             mo.build_pdf(result, "demo.txt", light, dark=False)
             mo.build_pdf(result, "demo.txt", dark, dark=True)
-            light_ops = b"\n".join(_pdf_content_streams(open(light, "rb").read()))
-            dark_ops = b"\n".join(_pdf_content_streams(open(dark, "rb").read()))
+            light_bytes = open(light, "rb").read()
+            dark_bytes = open(dark, "rb").read()
+            light_ops = b"\n".join(_pdf_content_streams(light_bytes))
+            dark_ops = b"\n".join(_pdf_content_streams(dark_bytes))
             self.assertNotIn(b"0 g 0 0 841.89 595.28 re f", light_ops)
-            self.assertEqual(dark_ops.count(b"0 g 0 0 841.89 595.28 re f"), 3)
+            # 2 frame pages painted black; the cover stays light (3
+            # pages total, only 2 background rects).
+            self.assertEqual(dark_ops.count(b"0 g 0 0 841.89 595.28 re f"), 2)
+            self.assertIn(b"(Theme: Dark)", dark_ops)
+            # The cover QR is identical in both variants (never inverted).
+            qr_re = re.compile(
+                rb"/Width 37 /Height 37 /BitsPerComponent 1 /ColorSpace "
+                rb"/DeviceGray /Filter /FlateDecode /Length (\d+) >>\nstream\n"
+            )
+
+            def qr_stream(pdf):
+                m = qr_re.search(pdf)
+                self.assertIsNotNone(m, "cover QR image not found")
+                length = int(m.group(1))
+                return pdf[m.end() : m.end() + length]
+
+            self.assertEqual(qr_stream(light_bytes), qr_stream(dark_bytes))
             self.assertEqual(mo.decode_pdf(dark), data)
 
     def test_pdf_logo_tile_is_skipped_by_extractor(self):
@@ -700,11 +1066,57 @@ class PdfTests(unittest.TestCase):
             mo.build_pdf(result, "demo.txt", pdf_path)
             pdf_bytes = open(pdf_path, "rb").read()
         extraction = mo.extract_pdf_frames(pdf_bytes)
-        # One code image per frame page + one shared RGB logo, but only
-        # the 1-bit code images are attempted — the logo is never parsed.
-        self.assertEqual(extraction.images_found, len(result.frames) + 1)
-        self.assertEqual(extraction.images_parsed, len(result.frames))
+        # One code image per frame page + one shared RGB logo + the
+        # cover QR; the 1-bit images (code + QR) are attempted, the
+        # logo is never parsed, and the QR fails the _is_frame check.
+        self.assertEqual(extraction.images_found, len(result.frames) + 2)
+        self.assertEqual(extraction.images_parsed, len(result.frames) + 1)
         self.assertEqual(len(extraction.frames), len(result.frames))
+
+    def test_pdf_cover_stripped_still_decodes(self):
+        # Blank the cover QR image in place (zero its Flate stream, same
+        # length — no xref changes) and the frames still decode: the
+        # decoder has NO dependency on the cover.
+        data = _sample_text(10)
+        result = mo.encode(data)
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = os.path.join(tmp, "out.pdf")
+            mo.build_pdf(result, "demo.txt", pdf_path)
+            pdf_bytes = bytearray(open(pdf_path, "rb").read())
+        qr_re = re.compile(
+            rb"/Width 37 /Height 37 /BitsPerComponent 1 /ColorSpace "
+            rb"/DeviceGray /Filter /FlateDecode /Length (\d+) >>\nstream\n"
+        )
+        m = qr_re.search(bytes(pdf_bytes))
+        self.assertIsNotNone(m, "cover QR image not found")
+        length = int(m.group(1))
+        pdf_bytes[m.end() : m.end() + length] = bytes(length)
+        with tempfile.TemporaryDirectory() as tmp:
+            stripped = os.path.join(tmp, "stripped.pdf")
+            with open(stripped, "wb") as fh:
+                fh.write(bytes(pdf_bytes))
+            self.assertEqual(mo.decode_pdf(stripped), data)
+
+    def test_pdf_no_cover_still_decodes(self):
+        # A PDF built with NO cover page at all still decodes — the
+        # cover is branding, not data.
+        data = _sample_text(10)
+        result = mo.encode(data)
+        writer = mo.RawPdfWriter()
+        for frame in result.frames:
+            raw = frame.to_bytes()
+            grid = mo.build_grid(raw)
+            writer.add_frame_page(
+                image_width=len(grid[0]),
+                image_height=len(grid),
+                image_deflate=mo.deflate_1bit(grid),
+                logo_rect=mo.logo_rect_for_grid(len(grid[0]), len(grid)),
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = os.path.join(tmp, "nocover.pdf")
+            with open(pdf_path, "wb") as fh:
+                fh.write(writer.build())
+            self.assertEqual(mo.decode_pdf(pdf_path), data)
 
     def test_logo_rect_is_square_and_inside_tile(self):
         # QR grid: the tile is square, the logo fills it exactly.
@@ -725,22 +1137,46 @@ class PdfTests(unittest.TestCase):
         self.assertAlmostEqual(x, tile_x + (tile_w - w) / 2, places=6)
         self.assertAlmostEqual(y, tile_bottom + (tile_h - w) / 2, places=6)
 
-    def test_pdf_full_frame_roundtrips_light_dark_qr_barcode(self):
-        # All 4 combinations, with full 64 KiB frames: 64 KiB of random
-        # data compresses to 2 data frames (the first a full 65536-byte
-        # payload) + 2 parity in one group = 4 frames.
+    def test_pdf_equal_split_roundtrips_light_dark_qr_barcode(self):
+        # All 4 combinations, with equal-split frames: 64 KiB of random
+        # data compresses to ~64 KiB, which splits into 2 equal
+        # ~32 KiB data frames + P1 (trio B empty, no P2) = 3 frames.
         data = os.urandom(64 * 1024)
         for barcode in (False, True):
             for dark in (False, True):
                 with self.subTest(barcode=barcode, dark=dark):
                     result = mo.encode(data, barcode=barcode)
-                    self.assertEqual(len(result.frames), 4)
-                    self.assertEqual(len(result.frames[0].payload), 65536)
+                    self.assertEqual(len(result.frames), 3)
+                    data_frames = [f for f in result.frames if f.is_data]
+                    self.assertEqual(len(data_frames), 2)
+                    self.assertEqual(len(data_frames[0].payload),
+                                     len(data_frames[1].payload))
                     with tempfile.TemporaryDirectory() as tmp:
                         pdf_path = os.path.join(tmp, "out.pdf")
                         stats = mo.build_pdf(result, "full.bin", pdf_path, dark=dark)
-                        self.assertEqual(stats.pages, 5)
+                        self.assertEqual(stats.pages, 4)
                         self.assertEqual(mo.decode_pdf(pdf_path), data)
+
+    def test_pdf_dart_samples_decode(self):
+        # Cross-check: the Dart-built samples in docs/samples/ decode
+        # through the Python extractor + decoder to the demo file
+        # (SHA-256 from docs/samples/README.md, passphrase published
+        # there on purpose). The samples predate the equal-split
+        # redesign, so this also proves old-format PDFs still decode;
+        # when the Dart worker rebuilds them in the new format this
+        # test proves the two sides agree byte-for-byte.
+        demo_sha = "e78a38dc1faafa0f9f8028feb41632503beae935517f31afac8e3ee32d42df55"
+        for name in ("middle-out-sample-light.pdf", "middle-out-sample-dark.pdf"):
+            fixture = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "docs", "samples", name,
+            )
+            with self.subTest(sample=name):
+                if not os.path.exists(fixture):
+                    self.skipTest("Dart sample not present")
+                data = mo.decode_pdf(fixture, "middle-out-sample-2026")
+                self.assertEqual(len(data), 1_048_576)
+                self.assertEqual(hashlib.sha256(data).hexdigest(), demo_sha)
 
     def test_pdf_old_format_grid_still_decodes(self):
         fixture = os.path.join(

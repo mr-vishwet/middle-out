@@ -8,7 +8,7 @@ import '../state/app_scope.dart';
 import '../widgets/frame_grid.dart';
 
 /// The encoded PDF (m08/w08): 1 cover page + 1 full-page code page per
-/// frame — and page 1 carries the decoder manifest.
+/// frame — and page 1 carries the file details and a QR code to the app.
 class PdfPreviewScreen extends StatelessWidget {
   /// Creates the PDF preview screen.
   const PdfPreviewScreen({super.key});
@@ -60,7 +60,7 @@ class PdfPreviewScreen extends StatelessWidget {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Cover — the decoder manifest',
+                            'Cover — file details',
                             style: theme.textTheme.titleMedium,
                           ),
                           const SizedBox(height: 8),
@@ -68,25 +68,7 @@ class PdfPreviewScreen extends StatelessWidget {
                           _line(
                             theme,
                             'Original size',
-                            '${encodeStats.originalSize} bytes',
-                          ),
-                          _line(
-                            theme,
-                            'Encoded payload',
-                            '${encodeStats.compressedSize} bytes',
-                          ),
-                          _line(
-                            theme,
-                            'Ratio',
-                            '${encodeStats.ratio.toStringAsFixed(1)}x',
-                          ),
-                          _line(theme, 'SHA-256', encodeStats.sha256Hex),
-                          _line(
-                            theme,
-                            'Frames',
-                            '${encodeStats.frameCount} '
-                            '(${encodeStats.groupCount} group(s) of '
-                            '6 DATA + 2 PARITY)',
+                            formatBytes(encodeStats.originalSize),
                           ),
                           _line(
                             theme,
@@ -95,11 +77,23 @@ class PdfPreviewScreen extends StatelessWidget {
                                 ? 'Barcode'
                                 : 'QR-style grid',
                           ),
+                          _line(
+                            theme,
+                            'Theme',
+                            controller.pdfDark ? 'Dark' : 'Light',
+                          ),
+                          _line(
+                            theme,
+                            'Pages',
+                            '${stats.pages} (cover + '
+                            '${result.frames.length} code)',
+                          ),
                           const SizedBox(height: 8),
                           Text(
-                            'Page 1 carries everything a reader needs: '
-                            'scan it with the Middle Out app to verify '
-                            'this file.',
+                            'Page 1 carries the file details and a QR '
+                            'code that opens the Middle Out app. The '
+                            'decode data (SHA-256, frame counts) lives '
+                            'in the frame headers, not on the cover.',
                             style: theme.textTheme.bodySmall,
                           ),
                         ],

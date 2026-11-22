@@ -1,3 +1,5 @@
+import 'dart:math' show min;
+
 import 'package:material_ui/material_ui.dart';
 
 import '../codec/code_grid.dart';
@@ -7,8 +9,8 @@ import '../core/routes.dart';
 import '../state/app_scope.dart';
 import '../widgets/frame_grid.dart';
 
-/// Frames view (m06/w06): the current encode's frames — six hold the
-/// file, two hold the parity, per group.
+/// Frames view (m06/w06): the current encode's frames — up to six hold
+/// the file, up to two hold the parity, per group.
 class FramesScreen extends StatelessWidget {
   /// Creates the frames view.
   const FramesScreen({super.key});
@@ -121,13 +123,18 @@ class FrameDetailScreen extends StatelessWidget {
           final frame = result.frames[frameIndex];
           final raw = frame.toBytes();
           // Stream byte range covered by this DATA frame's payload.
+          // The last data frame's payload is zero-padded to the chunk
+          // size, so the end is clamped to the true stream length.
           var streamStart = 0;
           for (var i = 0; i < frameIndex; i++) {
             if (result.frames[i].isData) {
               streamStart += result.frames[i].payload.length;
             }
           }
-          final streamEnd = streamStart + frame.payload.length;
+          final streamEnd = min(
+            streamStart + frame.payload.length,
+            result.stats.compressedSize,
+          );
           return SingleChildScrollView(
             padding: const EdgeInsets.all(20),
             child: Column(

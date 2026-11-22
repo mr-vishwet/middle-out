@@ -30,7 +30,7 @@ class EncodeStats {
   /// Frames in the encode (data + parity).
   final int frameCount;
 
-  /// 8-frame groups in the encode.
+  /// Parity groups in the encode (up to 8 frames each).
   final int groupCount;
 
   /// SHA-256 hex of the original file.
@@ -66,20 +66,28 @@ typedef EncodeProgress = void Function(double fraction, String label);
 /// Encodes a file into Middle Out frames.
 ///
 /// Pipeline: SHA-256 -> zlib-9 compress -> (optional ChaCha20 encrypt) ->
-/// split into <= [maxPayload] chunks -> group into 6 DATA + 2 XOR-parity.
+/// split into at most [kMaxDataPages] EQUAL chunks (the last zero-padded
+/// to the chunk size) -> group into 6 DATA + up to 2 XOR-parity.
 ///
 /// [encode] works on bytes already in memory, synchronously.
 /// [encodeAsync] runs the same pipeline in stages, yielding to the event
 /// loop between them so the UI can repaint the progress bar — the
 /// synchronous [encode] blocks the UI thread for the whole run, so the
 /// bar cannot move during it. [StreamingEncoder] runs the same pipeline
-/// chunk-by-chunk off disk for large native files; all three share
-/// [buildFrames], so a streamed encode is byte-identical in framing to
-/// an in-memory one (compression output may differ by chunking, which is
-/// fine — zlib streams are self-describing).
+/// chunk-by-chunk off disk for large native files, but with FIXED
+/// [kDefaultMaxPayload] chunks (it does not know the total upfront, so
+/// it cannot equal-split); all three share [buildFrames], so a streamed
+/// encode uses the same framing, headers and parity layout as an
+/// in-memory one — only the chunking and the equal-split flag differ.
 class Encoder {
   /// Encodes [data]. Pass [passphrase] to encrypt (default ON in the UI);
   /// pass null for a plain encode whose payload is human-readable.
+  ///
+  /// [maxPayload] is the sizing unit for the equal split: the stream is
+  /// divided into `min(kMaxDataPages, ceil(stream / maxPayload))` equal
+  /// chunks, so a chunk can be larger than [maxPayload] when the stream
+  /// needs more than [kMaxDataPages] chunks at that unit. Streaming
+  /// encodes keep [maxPayload] as a hard chunk size.
   static EncodeResult encode(
     Uint8List data, {
     String? passphrase,
@@ -175,11 +183,47 @@ class Encoder {
     );
   }
 
+  /// Equal-split chunking: the stream is divided into at most
+  /// [kMaxDataPages] equal chunks of [chunkSize] bytes
+  /// (`ceil(stream.length / count)`), so every code page is dense no
+  /// matter the file size. The LAST chunk is zero-padded to [chunkSize]
+  /// so all data frames (and the parity built from them) share one
+  /// width; the decoder trims the reassembled stream to
+  /// `compressedSize` before decrypt/decompress, stripping the padding.
+  ///
+  /// [maxPayload] is the sizing unit: `count =
+  /// min(kMaxDataPages, ceil(stream.length / maxPayload))`, clamped to
+  /// at least 1. The count is then re-derived from the chunk size
+  /// (`ceil(stream.length / chunkSize)`) so the last chunk is the only
+  /// short one — without that, a tiny stream with a tiny unit could
+  /// yield a short MIDDLE chunk (or an empty one), which the decoder
+  /// cannot represent. The decoder re-derives [chunkSize] from the
+  /// header alone (`ceil(compressedSize / totalDataFrames)`), so the
+  /// two always agree.
+  ///
+  /// An empty stream yields one empty chunk (one empty data frame, no
+  /// parity — [buildFrames] skips empty parities).
   static List<Uint8List> _chunk(Uint8List stream, int maxPayload) {
+    final unit = maxPayload < 1 ? 1 : maxPayload;
+    var count = ((stream.length + unit - 1) ~/ unit)
+        .clamp(1, kMaxDataPages);
+    final chunkSize = (stream.length + count - 1) ~/ count;
+    if (chunkSize > 0) {
+      // Re-derive the count from the chunk size (see the doc above).
+      count = (stream.length + chunkSize - 1) ~/ chunkSize;
+    }
     final chunks = <Uint8List>[];
-    for (var i = 0; i < stream.length; i += maxPayload) {
-      final end = math.min(i + maxPayload, stream.length);
-      chunks.add(Uint8List.sublistView(stream, i, end));
+    for (var i = 0; i < count; i++) {
+      final start = i * chunkSize;
+      final end = math.min(start + chunkSize, stream.length);
+      if (end - start == chunkSize) {
+        chunks.add(Uint8List.sublistView(stream, start, end));
+      } else {
+        // Last chunk, short: zero-pad to chunkSize.
+        final padded = Uint8List(chunkSize)
+          ..setAll(0, stream.sublist(start, end));
+        chunks.add(padded);
+      }
     }
     if (chunks.isEmpty) chunks.add(Uint8List(0));
     return chunks;
@@ -204,6 +248,7 @@ class Encoder {
       nonce: nonce,
       encrypted: encrypted,
       barcode: barcode,
+      equalSplit: true,
     );
     final totalGroups =
         (chunks.length + kGroupDataFrames - 1) ~/ kGroupDataFrames;
@@ -226,6 +271,21 @@ class Encoder {
   /// fields, parity construction and frame-index assignment are identical
   /// whichever path produced the stream. Throws [CodecException] when the
   /// encode would need more than [kMaxFrames] frames.
+  ///
+  /// A parity frame is emitted ONLY when its trio has at least one data
+  /// slot present AND the parity payload is non-empty: a trailing group
+  /// with <= 3 data frames has no second parity, and an empty encode
+  /// (one empty data frame) has no parity at all. An empty parity would
+  /// render as a near-blank code page. Parity frame indices keep the
+  /// formula `totalData + group*2 + (slot-6)`, so a skipped P2 leaves a
+  /// gap at the END of the index range only (P2 is skipped only in the
+  /// last group) — nothing assumes contiguous parity indices: the
+  /// decoder and the inspector key parity by (group, slot).
+  ///
+  /// [equalSplit] sets [kFlagEqualSplit] on every frame: the chunks are
+  /// equal-sized (last zero-padded) and the decoder derives the chunk
+  /// size from the header. Streaming chunks are fixed-size and leave
+  /// the flag clear.
   static List<Frame> buildFrames({
     required List<Uint8List> chunks,
     required Uint8List sha256Bytes,
@@ -235,10 +295,13 @@ class Encoder {
     required Uint8List nonce,
     required bool encrypted,
     required bool barcode,
+    bool equalSplit = false,
   }) {
     final dataChunks = chunks.isEmpty ? [Uint8List(0)] : chunks;
     final totalData = dataChunks.length;
     final totalGroups = (totalData + kGroupDataFrames - 1) ~/ kGroupDataFrames;
+    // Upper bound — skipped (empty-trio) parities make the real count
+    // smaller, which only helps the cap.
     final totalFrames = totalData + totalGroups * kGroupParityFrames;
     if (totalFrames > kMaxFrames) {
       throw CodecException(
@@ -251,6 +314,7 @@ class Encoder {
     var baseFlags = 0;
     if (encrypted) baseFlags |= kFlagEncrypted;
     if (barcode) baseFlags |= kFlagBarcode;
+    if (equalSplit) baseFlags |= kFlagEqualSplit;
 
     Frame buildFrame({
       required int frameIndex,
@@ -305,6 +369,11 @@ class Encoder {
           for (final slot in entry.value)
             if (slot < groupChunks.length) groupChunks[slot],
         ];
+        // Skip empty trios (and all-empty trios, e.g. an empty encode):
+        // an empty parity would render as a near-blank code page.
+        if (trioPayloads.isEmpty) continue;
+        final parity = Erasure.buildParity(trioPayloads);
+        if (parity.isEmpty) continue;
         frames.add(
           buildFrame(
             frameIndex: totalData +
@@ -314,7 +383,7 @@ class Encoder {
             group: group,
             slot: entry.key,
             flags: groupFlags,
-            payload: Erasure.buildParity(trioPayloads),
+            payload: parity,
           ),
         );
       }

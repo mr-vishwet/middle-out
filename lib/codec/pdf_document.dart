@@ -1,9 +1,10 @@
-import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 
+import '../core/format.dart';
 import 'code_grid.dart';
+import 'cover_qr.dart';
 import 'encoder.dart';
 import 'logo_tile.dart';
 import 'pdf_writer.dart';
@@ -33,14 +34,16 @@ class BuildCancelledException implements Exception {
   String toString() => 'Build cancelled';
 }
 
-/// Assembles the encoded PDF: 1 portrait cover page + 1 landscape
+/// Assembles the encoded PDF: 1 landscape cover page + 1 landscape
 /// full-bleed code page per frame, each frame embedded as a 1-bit image
 /// XObject with the logo tile over its centre.
 ///
-/// The cover carries a small square Middle Out Code grid with the decode
-/// manifest (file name, sizes, SHA-256, frame count) — scannable by the
-/// app. A real ISO QR cover code (readable by any phone camera) is a
-/// v0.2 item.
+/// The cover carries branding (logo tile + "MIDDLE OUT" wordmark), file
+/// details only (name, original size, code format, theme, page count),
+/// and a real scannable QR code to the Middle Out web app. It carries NO
+/// SHA-256, payload size, ratio, frame counts or decode instructions —
+/// those live in the frame headers, and the decoder never reads the
+/// cover. The cover stays light in both variants.
 ///
 /// The document is assembled by [RawPdfWriter], not the `pdf` package:
 /// the package has no public API for a 1-bit image XObject, and its
@@ -128,20 +131,14 @@ class PdfDocument {
       logoHeight: LogoTile.size,
     );
 
-    // Cover page (unchanged: portrait, manifest text + small square
-    // grid with its quiet zone, light in both variants).
-    final manifest = _manifestText(result, fileName);
-    final manifestGrid = CodeGrid.buildGrid(
-      Uint8List.fromList(utf8.encode(manifest)),
-      aspect: 1.0,
-    );
-    final (manifestW, manifestH, manifestDeflate) =
-        _coverGridDeflate(manifestGrid);
+    // Cover page: landscape like the code pages, branding + details +
+    // the scannable QR, light in both variants.
+    final (qrW, qrH, qrDeflate) = _coverQrDeflate();
     writer.addCoverPage(
-      manifestLines: manifest.split('\n'),
-      imageWidth: manifestW,
-      imageHeight: manifestH,
-      imageDeflate: manifestDeflate,
+      detailLines: _detailLines(result, fileName, dark),
+      imageWidth: qrW,
+      imageHeight: qrH,
+      imageDeflate: qrDeflate,
     );
 
     for (final image in images) {
@@ -161,25 +158,34 @@ class PdfDocument {
     );
   }
 
-  static String _manifestText(EncodeResult result, String fileName) {
+  /// The cover's detail lines: file name, original size, code format,
+  /// theme, page count — nothing else. No SHA-256, payload size, ratio
+  /// or frame counts: those live in the frame headers, not on the cover.
+  /// Long file names are truncated so the line cannot run into the QR.
+  static List<String> _detailLines(
+    EncodeResult result,
+    String fileName,
+    bool dark,
+  ) {
+    const maxName = 80;
+    final name = fileName.length > maxName
+        ? '${fileName.substring(0, maxName - 3)}...'
+        : fileName;
     final stats = result.stats;
     return [
-      'File: $fileName',
-      'Original size: ${stats.originalSize} bytes',
-      'Encoded payload: ${stats.compressedSize} bytes',
-      'Ratio: ${stats.ratio.toStringAsFixed(1)}x',
-      'SHA-256: ${stats.sha256Hex}',
-      'Frames: ${stats.frameCount} '
-          '(${stats.groupCount} group(s) of 6 DATA + 2 PARITY)',
+      'File: $name',
+      'Original size: ${formatBytes(stats.originalSize)}',
       'Format: ${result.barcode ? 'Barcode' : 'QR-style grid'}',
-      'Decode with the Middle Out app — scan the frames in order.',
-    ].join('\n');
+      'Theme: ${dark ? 'Dark' : 'Light'}',
+      'Pages: ${1 + result.frames.length}',
+    ];
   }
 
-  /// Cover grid matrix -> (width, height, deflate), with a quiet zone of
-  /// white modules around the grid (the cover keeps its quiet zone;
-  /// full-bleed code pages have none).
-  static (int, int, Uint8List) _coverGridDeflate(List<Uint8List> grid) {
+  /// The cover QR as (width, height, deflate), with a quiet zone of
+  /// white modules around it. The quiet zone is REQUIRED — a QR without
+  /// one fails to scan (see [CoverQr]).
+  static (int, int, Uint8List) _coverQrDeflate() {
+    final grid = CoverQr.modules;
     final h = grid.length;
     final w = grid[0].length;
     const quiet = CodeGrid.quietModules;

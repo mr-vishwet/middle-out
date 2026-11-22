@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 
 import '../codec/decoder.dart';
 import '../codec/encoder.dart';
+import '../codec/erasure.dart';
 import '../codec/frame.dart';
 import '../codec/pdf_document.dart';
 import '../codec/streaming_encoder.dart';
@@ -102,23 +103,31 @@ class EncodeController extends ChangeNotifier {
 
   /// Builds an estimate from a measured compression [ratio] and file
   /// size. Pure (no I/O) so the frame-count and cap math is unit-testable.
+  ///
+  /// In-memory encodes equal-split: at most [kMaxDataPages] data frames
+  /// (so the frame count never exceeds 28 and the cap never binds).
+  /// [streaming] encodes use fixed [kDefaultMaxPayload] chunks instead
+  /// and CAN exceed the cap. Parity counts one per non-empty trio in
+  /// both paths. The PDF estimate is the compressed bytes plus per-frame
+  /// overhead: a 1-bit code image is about the size of its frame.
   static EncodeEstimate estimateFor({
     required int fileSize,
     required double ratio,
     required int sampleBytes,
+    bool streaming = false,
   }) {
     final clampedRatio = ratio.clamp(1.0, 1000.0);
     final estCompressed = (fileSize / clampedRatio).ceil();
-    final dataFrames =
+    final rawDataFrames =
         (estCompressed + kDefaultMaxPayload - 1) ~/ kDefaultMaxPayload;
-    final groups =
-        (dataFrames + kGroupDataFrames - 1) ~/ kGroupDataFrames;
-    final frames = dataFrames + groups * kGroupParityFrames;
+    final dataFrames = streaming
+        ? (rawDataFrames < 1 ? 1 : rawDataFrames)
+        : rawDataFrames.clamp(1, kMaxDataPages);
+    final frames = dataFrames + Erasure.parityFrameCount(dataFrames);
     return EncodeEstimate(
       ratio: clampedRatio,
       estimatedFrames: frames,
-      // ~60 KB per full-page code image + cover overhead.
-      estimatedPdfBytes: frames * 60000 + 20000,
+      estimatedPdfBytes: estCompressed + frames * 2000 + 20000,
       estimatedSeconds:
           (fileSize / (25 * 1024 * 1024)).ceil().clamp(1, 3600 * 24),
       sampleBytes: sampleBytes,
@@ -303,10 +312,17 @@ class EncodeController extends ChangeNotifier {
         sampled += sample.length;
       }
       if (ratio.isInfinite) ratio = 1.0;
+      // Streaming encodes (large native files) frame in fixed 64 KiB
+      // chunks, so their frame count follows the streaming rule; the
+      // in-memory path equal-splits. Same routing as [encode].
+      final willStream = !kIsWeb &&
+          current.hasPath &&
+          current.size >= streamingThresholdBytes;
       estimate = estimateFor(
         fileSize: current.size,
         ratio: ratio,
         sampleBytes: sampled,
+        streaming: willStream,
       );
     } catch (_) {
       estimate = null;

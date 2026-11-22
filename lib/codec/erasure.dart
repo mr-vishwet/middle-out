@@ -14,9 +14,10 @@ import '../core/constants.dart';
 /// for a lost frame, from the encode metadata — see `decoder.dart`).
 class Erasure {
   /// Builds the parity payload for one trio of data payloads.
-  /// Returns empty bytes when the trio has no frames (a trailing group
-  /// whose second trio is empty still emits a parity frame, keeping every
-  /// group at exactly 8 frames for a uniform PDF layout).
+  /// Returns empty bytes when the trio has no frames, or when every
+  /// payload in it is empty. [Encoder.buildFrames] does NOT emit a
+  /// parity frame for an empty trio — an empty parity would render as a
+  /// near-blank code page (a 45x32 grid on an otherwise dense PDF).
   static Uint8List buildParity(List<Uint8List> trioPayloads) {
     if (trioPayloads.isEmpty) return Uint8List(0);
     var width = 0;
@@ -30,6 +31,26 @@ class Erasure {
       }
     }
     return parity;
+  }
+
+  /// How many parity frames an encode of [totalDataFrames] data frames
+  /// emits: one per non-empty trio (trio A whenever the group has any
+  /// data, trio B when it has more than 3). Mirrors the skip rule in
+  /// [Encoder.buildFrames]; the estimate and the frame inspector use it
+  /// so their frame counts agree with what the encoder actually emits.
+  static int parityFrameCount(int totalDataFrames) {
+    if (totalDataFrames <= 0) return 0;
+    final groups =
+        (totalDataFrames + kGroupDataFrames - 1) ~/ kGroupDataFrames;
+    var count = 0;
+    for (var group = 0; group < groups; group++) {
+      final groupDataCount =
+          (totalDataFrames - group * kGroupDataFrames)
+              .clamp(0, kGroupDataFrames);
+      if (groupDataCount >= 1) count++; // trio A
+      if (groupDataCount > 3) count++; // trio B
+    }
+    return count;
   }
 
   /// Rebuilds one lost payload from its parity frame and its surviving

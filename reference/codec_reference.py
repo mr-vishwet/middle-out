@@ -9,11 +9,19 @@ without a Flutter toolchain. The Dart side and this file MUST agree on:
   * the 100-byte v2 frame header layout (v1's 97-byte header still parses),
   * zlib level-9 compression of the whole file before chunking,
   * ChaCha20 (RFC 8439) with a PBKDF2-HMAC-SHA256 derived key,
-  * XOR parity: 6 DATA + 2 PARITY per group, trios (0,1,2) and (3,4,5),
+  * EQUAL-SPLIT framing: at most 20 data frames, the (compressed+
+    encrypted) stream divided into N equal chunks (the last zero-padded
+    to chunkSize), flag bit 0x08 on every frame; the decoder trims the
+    reassembled stream to compressedSize before decrypt/decompress,
+  * XOR parity: 6 DATA + 2 PARITY per group, trios (0,1,2) and (3,4,5);
+    a parity frame is emitted ONLY when its trio has >= 1 data slot
+    present (a group with <= 3 data frames has no P2),
   * the rectangular Middle Out Code grid geometry (QR aspect ~1.41421,
     bar-grid aspect ~5.65685) and the legacy stacked-row barcode format,
-  * the full-bleed PDF: landscape code pages, light/dark variants, and
-    the centre logo-tile overlay.
+  * the full-bleed PDF: landscape code pages AND a landscape branded
+    cover (logo + wordmark + simple details + a real scannable QR to
+    the app site, light in both variants), light/dark code variants,
+    and the centre logo-tile overlay.
 
 Run the test suite:  python3 test_codec_reference.py
 CLI:                  python3 codec_reference.py encode in.bin out.pdf
@@ -58,6 +66,10 @@ KIND_PARITY = 1
 FLAG_ENCRYPTED = 0x01
 FLAG_LAST_GROUP = 0x02
 FLAG_BARCODE = 0x04
+# Set on EVERY frame of an equal-split encode (see encode()). The decoder
+# uses it to derive chunkSize as ceil(compressedSize / totalDataFrames);
+# when it is unset the old derivation applies (old PDFs still decode).
+FLAG_EQUAL_SPLIT = 0x08
 
 GROUP_DATA_FRAMES = 6
 GROUP_PARITY_FRAMES = 2
@@ -68,11 +80,22 @@ PARITY_A_SLOT = 6
 PARITY_B_SLOT = 7
 
 DEFAULT_MAX_PAYLOAD = 65536
+# Equal-split cap: an encode never has more than 20 data frames, so
+# every code page is as dense as every other (no sparse near-empty
+# last page). N_data = min(20, ceil(streamLen / max_payload)),
+# chunkSize = ceil(streamLen / N_data); the last chunk is zero-padded
+# to chunkSize and the decoder trims the reassembled stream to
+# compressedSize. A 1 GB input at ~20 frames means ~50 MB frames —
+# the grid cap below (32768) is what bounds the page, not this.
+MAX_DATA_FRAMES = 20
 # Policy guardrail, not a format limit: v2 frame_index is uint16, so the
 # format can address 65,535 frames. 4096 covers the 1 GB hero case
 # (~300 frames) 13x over and the largest real-world report so far (a
 # 67 MB mp4 needing 1,125 frames) 3.6x over, while bounding the PDF at
 # ~250 MB and in-memory frame payloads at ~256 MB.
+# NOTE: with the 20-data-frame equal-split cap an encode can never
+# exceed 28 frames (20 data + 8 parity), so this guard is unreachable
+# through encode() now — it stays as defence-in-depth.
 MAX_FRAMES = 4096
 
 PBKDF2_ITERATIONS = 100_000
@@ -82,11 +105,19 @@ KEY_LEN = 32
 
 # --- Full-bleed code-page geometry (mirrors lib/codec/code_grid.dart) ---
 # Code pages are A4 LANDSCAPE and the code image spans the ENTIRE page
-# rect — no margins, no caption, no quiet zone. The cover stays portrait.
+# rect — no margins, no caption, no quiet zone. The cover is landscape
+# too (branding + simple details + a real scannable QR, light in both
+# variants) — same page size as the code pages.
 CODE_PAGE_WIDTH = 841.89
 CODE_PAGE_HEIGHT = 595.28
-COVER_PAGE_WIDTH = 595.28
-COVER_PAGE_HEIGHT = 841.89
+COVER_PAGE_WIDTH = 841.89
+COVER_PAGE_HEIGHT = 595.28
+# Cover layout (points, PDF origin bottom-left): logo tile top-left,
+# "MIDDLE OUT" wordmark beside it, five detail lines down the left,
+# the scannable QR centred vertically on the right.
+COVER_MARGIN = 48.0
+COVER_LOGO_SIDE = 72.0
+COVER_QR_SIZE_PT = 180.0
 # QR grids match the page aspect; the bar-grid stretches it 4x, so each
 # module draws as a tall thin rectangle and adjacent black modules merge
 # into vertical bars.
@@ -95,7 +126,10 @@ BARCODE_STRETCH = 4
 BARCODE_ASPECT = BARCODE_STRETCH * QR_ASPECT  # ~5.65685
 GRID_MIN_HEIGHT = 32
 GRID_HEIGHT_STEP = 2
-GRID_MAX_HEIGHT = 4096
+# Equal-split frames are much bigger than the old 64 KiB frames (a 1 GB
+# input splits into ~50 MB frames), so the grid height cap is 32768 —
+# the same value as the Dart side. A 5 MB frame needs h ~= 5450.
+GRID_MAX_HEIGHT = 32768
 
 # --- Centre logo tile (docs/screenshots/app-icon.png, verified by eye:
 # black rounded-square tile, white pixel-M, green dot) ---
@@ -275,6 +309,50 @@ LOGO_RGB_PIXELS = base64.b64decode(LOGO_RGB_PIXELS_B64)
 assert len(LOGO_RGB_PIXELS) == LOGO_SIZE * LOGO_SIZE * 3
 LOGO_DEFLATE = zlib.compress(LOGO_RGB_PIXELS, 6)
 
+# --- Cover QR: a REAL scannable ISO QR code to the app site ---
+# Version 3, 29x29 modules, ECL M, packed row-major MSB-first,
+# 1 = black, 106 bytes (29*29 = 841 bits). Encodes exactly
+# https://mr-vishwet.github.io/middle-out/ — verified decodable by
+# cv2 QRCodeDetector to that exact URL. Drawn on the cover with a
+# >= 4-module quiet zone around it (a QR without a quiet zone fails
+# to scan). This is a genuine ISO QR code, NOT a Middle Out grid:
+# the extractor's _is_frame check rejects it, so it is never
+# mistaken for a frame.
+COVER_QR_URL = "https://mr-vishwet.github.io/middle-out/"
+COVER_QR_SIZE = 29
+COVER_QR_QUIET_MODULES = 4
+COVER_QR_MODULES_B64 = (
+    "/iIj/Bd1EG6+6rt1y4XbpaGuwTVFB/qqr+AaUACCn1Z2SsmNntjbgclhe4l4K6DsQv/NXB0XjYYGpWORUGdm75Xzyn9Ta5kRCno0+4BJvGP4Z2uQREMQuj6/1dIfq26Z9P0EZA/f70UyAA=="
+)
+COVER_QR_MODULES = base64.b64decode(COVER_QR_MODULES_B64)
+assert len(COVER_QR_MODULES) == 106  # ceil(29*29 / 8)
+
+
+def cover_qr_grid() -> list[bytearray]:
+    """Unpack the cover QR const into a 29x29 module matrix (1 = black)."""
+    grid: list[bytearray] = []
+    for r in range(COVER_QR_SIZE):
+        row = bytearray(COVER_QR_SIZE)
+        for c in range(COVER_QR_SIZE):
+            i = r * COVER_QR_SIZE + c
+            row[c] = (COVER_QR_MODULES[i >> 3] >> (7 - (i & 7))) & 1
+        grid.append(row)
+    return grid
+
+
+def cover_qr_grid_with_quiet(
+    quiet: int = COVER_QR_QUIET_MODULES,
+) -> list[bytearray]:
+    """The cover QR with a [quiet]-module white border on every side
+    (37x37 at the default 4). The quiet zone is REQUIRED — a QR
+    without one fails to scan."""
+    n = COVER_QR_SIZE + 2 * quiet
+    grid = [bytearray(n) for _ in range(n)]
+    inner = cover_qr_grid()
+    for r in range(COVER_QR_SIZE):
+        grid[r + quiet][quiet : quiet + COVER_QR_SIZE] = inner[r]
+    return grid
+
 
 class CodecError(Exception):
     """Base class for all Middle Out codec failures."""
@@ -399,6 +477,10 @@ class Frame:
     def is_barcode(self) -> bool:
         return bool(self.flags & FLAG_BARCODE)
 
+    @property
+    def is_equal_split(self) -> bool:
+        return bool(self.flags & FLAG_EQUAL_SPLIT)
+
     def to_bytes(self) -> bytes:
         header_wo_crc = struct.pack(
             ">4sBHBHBBHHIQQ32s16s12s",
@@ -516,6 +598,32 @@ class EncodeResult:
     barcode: bool = False
 
 
+def _split_equal(stream: bytes, max_payload: int) -> list[bytes]:
+    """Equal-split chunking (mirrors Dart's Encoder._chunk exactly,
+    including the count re-derivation): N = min(20,
+    ceil(len / max_payload)) chunks of chunkSize = ceil(len / N); the
+    LAST chunk is zero-padded to chunkSize so every data frame (and
+    every parity frame) is the same width — every code page comes out
+    equally dense. The count is re-derived from the chunk size
+    (ceil(len / chunkSize)) so the last chunk is the only short one.
+    An empty stream yields one empty chunk (one empty data frame, no
+    parity — parity of nothing is nothing)."""
+    if len(stream) == 0:
+        return [b""]
+    unit = max(1, max_payload)
+    n_data = min(MAX_DATA_FRAMES, (len(stream) + unit - 1) // unit)
+    n_data = max(1, n_data)
+    chunk_size = (len(stream) + n_data - 1) // n_data
+    if chunk_size > 0:
+        # Re-derive the count from the chunk size (see Dart's _chunk).
+        n_data = (len(stream) + chunk_size - 1) // chunk_size
+    chunks = [
+        stream[i * chunk_size : (i + 1) * chunk_size] for i in range(n_data)
+    ]
+    chunks[-1] = _pad(chunks[-1], chunk_size)
+    return chunks
+
+
 def encode(
     data: bytes,
     passphrase: str | None = None,
@@ -525,8 +633,12 @@ def encode(
 ) -> EncodeResult:
     """Encode [data] into Middle Out frames.
 
-    Pipeline: SHA-256 -> zlib-9 compress -> (optional ChaCha20 encrypt) ->
-    split into <= max_payload chunks -> group into 6 DATA + 2 XOR-parity.
+    Pipeline: SHA-256 -> zlib-9 compress -> (optional ChaCha20 encrypt)
+    -> EQUAL-SPLIT into at most 20 equal chunks (last zero-padded) ->
+    group into 6 DATA + up to 2 XOR-parity. Every frame carries the
+    FLAG_EQUAL_SPLIT bit; a parity frame is emitted ONLY when its trio
+    has >= 1 data slot present, so a group with <= 3 data frames has
+    no P2 (and the empty-input edge has no parity at all).
     """
     sha = hashlib.sha256(data).digest()
     compressed = zlib.compress(data, 9)
@@ -541,20 +653,15 @@ def encode(
         nonce = bytes(NONCE_LEN)
         stream = compressed
 
-    chunks = [stream[i : i + max_payload] for i in range(0, len(stream), max_payload)]
-    if not chunks:
-        chunks = [b""]
+    chunks = _split_equal(stream, max_payload)
     total_data = len(chunks)
     total_groups = (total_data + GROUP_DATA_FRAMES - 1) // GROUP_DATA_FRAMES
-    total_frames = total_data + total_groups * GROUP_PARITY_FRAMES
-    if total_frames > MAX_FRAMES:
-        raise CodecError(
-            f"This file needs {total_frames} frames — over the {MAX_FRAMES}-frame "
-            "limit for one PDF. Split it into smaller files and encode each "
-            "one separately."
-        )
 
-    base_flags = (FLAG_ENCRYPTED if encrypted else 0) | (FLAG_BARCODE if barcode else 0)
+    base_flags = (
+        (FLAG_ENCRYPTED if encrypted else 0)
+        | (FLAG_BARCODE if barcode else 0)
+        | FLAG_EQUAL_SPLIT
+    )
     frames: list[Frame] = []
     for group in range(total_groups):
         group_chunks = chunks[group * GROUP_DATA_FRAMES : (group + 1) * GROUP_DATA_FRAMES]
@@ -582,13 +689,15 @@ def encode(
             (PARITY_B_TRIO, PARITY_B_SLOT),
         ):
             present = [group_chunks[s] for s in trio if s < len(group_chunks)]
-            if present:
-                width = max(len(c) for c in present)
-                parity = bytes(width)
-                for chunk in present:
-                    parity = _xor_bytes(parity, _pad(chunk, width))
-            else:
-                parity = b""
+            # Parity ONLY when the trio has >= 1 data slot present AND
+            # the parity would be non-empty: a trio of empty chunks
+            # (the empty-input edge) gets no parity frame at all.
+            if not present or max(len(c) for c in present) == 0:
+                continue
+            width = max(len(c) for c in present)
+            parity = bytes(width)
+            for chunk in present:
+                parity = _xor_bytes(parity, _pad(chunk, width))
             frames.append(
                 Frame(
                     frame_index=total_data
@@ -609,6 +718,13 @@ def encode(
                 )
             )
 
+    if len(frames) > MAX_FRAMES:
+        raise CodecError(
+            f"This file needs {len(frames)} frames — over the {MAX_FRAMES}-frame "
+            "limit for one PDF. Split it into smaller files and encode each "
+            "one separately."
+        )
+
     stats = EncodeStats(
         original_size=len(data),
         compressed_size=len(stream),
@@ -621,11 +737,16 @@ def encode(
 
 
 def _expected_data_length(
-    frame_index: int, total_data_frames: int, compressed_size: int, max_payload: int
+    frame_index: int, total_data_frames: int, compressed_size: int, chunk_size: int
 ) -> int:
+    """Expected payload length of data frame [frame_index]: every frame
+    but the last is a full [chunk_size]; the last carries the remainder.
+    [chunk_size] is max_payload for old (fixed-chunk) frames and
+    ceil(compressedSize / totalData) for equal-split frames — the
+    formula is the same either way."""
     if frame_index < total_data_frames - 1:
-        return max_payload
-    return compressed_size - max_payload * (total_data_frames - 1)
+        return chunk_size
+    return compressed_size - chunk_size * (total_data_frames - 1)
 
 
 def decode(frame_blobs: list[bytes], passphrase: str | None = None) -> bytes:
@@ -634,6 +755,12 @@ def decode(frame_blobs: list[bytes], passphrase: str | None = None) -> bytes:
     Corrupt (CRC-failing) frames are treated as lost and rebuilt from parity
     where possible. Raises UnrecoverableError when a parity trio lost two or
     more frames, VerificationError when the rebuilt bytes fail SHA-256.
+
+    Equal-split frames (FLAG_EQUAL_SPLIT set) derive chunkSize as
+    ceil(compressedSize / totalDataFrames) and the reassembled stream is
+    trimmed to compressedSize (the last chunk is zero-padded); old
+    frames keep the previous derivation (chunkSize = a non-last data
+    frame's payload length, or compressedSize for a single frame).
     """
     frames: list[Frame] = []
     for blob in frame_blobs:
@@ -650,15 +777,20 @@ def decode(frame_blobs: list[bytes], passphrase: str | None = None) -> bytes:
     total_groups = meta.total_groups
     compressed_size = meta.compressed_size
 
-    # Derive max_payload from any present non-last data frame.
-    max_payload = DEFAULT_MAX_PAYLOAD
-    for f in frames:
-        if f.is_data and not f.payload_corrupt and f.frame_index < total_data - 1:
-            max_payload = len(f.payload)
-            break
+    if meta.is_equal_split:
+        # Equal-split: chunkSize is pure arithmetic from the header.
+        chunk_size = (compressed_size + total_data - 1) // total_data
     else:
-        if total_data == 1:
-            max_payload = compressed_size
+        # Old format: derive max_payload from any present non-last data
+        # frame (non-last frames are always full-width).
+        chunk_size = DEFAULT_MAX_PAYLOAD
+        for f in frames:
+            if f.is_data and not f.payload_corrupt and f.frame_index < total_data - 1:
+                chunk_size = len(f.payload)
+                break
+        else:
+            if total_data == 1:
+                chunk_size = compressed_size
 
     by_group_slot: dict[tuple[int, int], Frame] = {}
     for f in frames:
@@ -696,7 +828,7 @@ def decode(frame_blobs: list[bytes], passphrase: str | None = None) -> bytes:
                     rebuilt = _xor_bytes(rebuilt, _pad(by_group_slot[(group, s)].payload, width))
             frame_index = group * GROUP_DATA_FRAMES + missing[0]
             want = _expected_data_length(
-                frame_index, total_data, compressed_size, max_payload
+                frame_index, total_data, compressed_size, chunk_size
             )
             recovered[frame_index] = rebuilt[:want]
 
@@ -711,12 +843,18 @@ def decode(frame_blobs: list[bytes], passphrase: str | None = None) -> bytes:
             raise UnrecoverableError(f"data frame {index} missing, unrecoverable")
         stream += frame.payload
 
+    # Equal-split frames zero-pad the last chunk to chunkSize: trim the
+    # reassembled stream back to compressedSize before decrypt /
+    # decompress. For old frames the stream is already exactly
+    # compressedSize long, so the trim is a no-op there.
+    stream = bytes(stream[:compressed_size])
+
     if meta.is_encrypted:
         if passphrase is None:
             raise VerificationError("frames are encrypted; a passphrase is required")
         key = derive_key(passphrase, meta.salt)
         try:
-            plain = chacha20_xor(key, meta.nonce, bytes(stream))
+            plain = chacha20_xor(key, meta.nonce, stream)
             data = zlib.decompress(plain)
         except Exception as exc:
             raise VerificationError(
@@ -724,7 +862,7 @@ def decode(frame_blobs: list[bytes], passphrase: str | None = None) -> bytes:
             ) from exc
     else:
         try:
-            data = zlib.decompress(bytes(stream))
+            data = zlib.decompress(stream)
         except Exception as exc:
             raise VerificationError("decompress failed — frames are corrupt") from exc
 
@@ -1190,9 +1328,10 @@ def sample_barcode_image(img) -> list[bytearray]:
 # vs ~1 ms to serialise a page here.)
 #
 # Document shape (fixed): Catalog, Pages, Helvetica + Helvetica-Bold
-# (standard-14 fonts, never embedded), one shared RGB logo XObject (when
-# the document has frame pages), then per page: Page, Flate content
-# stream, code image XObject.
+# (standard-14 fonts, never embedded), one shared RGB logo XObject (the
+# cover and every frame page draw it), then per page: Page, Flate
+# content stream, and one image XObject — the cover's 1-bit QR image
+# (37x37 with its quiet zone) or the frame's 1-bit code image.
 # The image dicts deliberately contain NO nested dictionary: the extractor
 # finds an image dict by scanning back to the nearest `<<` before `stream`,
 # so a nested DecodeParms dict would be found instead of the outer dict.
@@ -1269,22 +1408,62 @@ class _PdfPageSpec:
     image_deflate: bytes = b""
     logo_rect: tuple[float, float, float, float] | None = None  # x, y, w, h
     dark: bool = False
+    # Cover only: the scannable QR (a 1-bit image like the code images).
+    qr_width: int = 0
+    qr_height: int = 0
+    qr_deflate: bytes = b""
+
+
+def _cover_logo_rect() -> tuple[float, float, float, float]:
+    """Logo rect on the cover: top-left, inside the margin."""
+    return (
+        COVER_MARGIN,
+        COVER_PAGE_HEIGHT - COVER_MARGIN - COVER_LOGO_SIDE,
+        COVER_LOGO_SIDE,
+        COVER_LOGO_SIDE,
+    )
+
+
+def _cover_qr_rect() -> tuple[float, float, float, float]:
+    """QR rect on the cover: right side, centred vertically."""
+    return (
+        COVER_PAGE_WIDTH - COVER_MARGIN - COVER_QR_SIZE_PT,
+        (COVER_PAGE_HEIGHT - COVER_QR_SIZE_PT) / 2,
+        COVER_QR_SIZE_PT,
+        COVER_QR_SIZE_PT,
+    )
 
 
 def _page_content(page: _PdfPageSpec) -> bytes:
     """The page's content-stream operators (uncompressed)."""
     ops: list[str] = []
     if page.is_cover:
-        # Unchanged cover layout (same text, sizes and margins as the old
-        # reportlab cover): title, subtitle, manifest lines, portrait A4.
-        mm = 72 / 25.4
+        # Branded landscape cover: logo + "MIDDLE OUT" wordmark, five
+        # detail lines down the left (file name, original size, code
+        # format, theme, page count — and NOTHING else: no SHA-256, no
+        # encoded payload size, no ratio, no frame/group counts, no
+        # decode instructions, no manifest grid), and the real
+        # scannable QR on the right. The cover stays LIGHT in both
+        # variants — no black background, no inverted QR.
         width, height = COVER_PAGE_WIDTH, COVER_PAGE_HEIGHT
-        ops.append(_text_op("MIDDLE OUT", 34, 20 * mm, height - 30 * mm, bold=True))
-        ops.append(_text_op("Lossless file, printed as code.", 12, 20 * mm, height - 42 * mm))
-        y = height - 60 * mm
+        logo_x, logo_y, logo_side, _ = page.logo_rect or _cover_logo_rect()
+        ops.append(_logo_op(logo_x, logo_y, logo_side))
+        ops.append(
+            _text_op(
+                "MIDDLE OUT",
+                40,
+                logo_x + logo_side + 24,
+                height - COVER_MARGIN - 44,
+                bold=True,
+            )
+        )
+        y = height - COVER_MARGIN - 120
         for line in page.manifest_lines:
-            ops.append(_text_op(line, 11, 20 * mm, y))
-            y -= 7 * mm
+            ops.append(_text_op(line, 14, COVER_MARGIN, y))
+            y -= 30
+        if page.qr_deflate:
+            qx, qy, qw, qh = _cover_qr_rect()
+            ops.append(_image_op("ImQR", qw, qh, qx, qy))
     else:
         # Full-bleed code page: the image spans the ENTIRE landscape rect
         # — no margins, no caption, no quiet zone. Dark pages paint the
@@ -1302,16 +1481,31 @@ def _page_content(page: _PdfPageSpec) -> bytes:
 
 
 class RawPdfWriter:
-    """Minimal PDF writer: 1 portrait cover page + 1 landscape full-bleed
-    code page per frame, each frame embedded as a 1-bit DeviceGray image
-    XObject plus the RGB logo tile over its centre."""
+    """Minimal PDF writer: 1 landscape branded cover page + 1 landscape
+    full-bleed code page per frame, each frame embedded as a 1-bit
+    DeviceGray image XObject plus the RGB logo tile over its centre.
+    The cover carries the logo, the wordmark, five detail lines, and
+    the 1-bit scannable QR image (with its quiet zone)."""
 
     def __init__(self) -> None:
         self._pages: list[_PdfPageSpec] = []
 
-    def add_cover_page(self, manifest_lines: list[str]) -> None:
+    def add_cover_page(
+        self,
+        detail_lines: list[str],
+        qr_deflate: bytes = b"",
+        qr_width: int = 0,
+        qr_height: int = 0,
+    ) -> None:
         self._pages.append(
-            _PdfPageSpec(is_cover=True, manifest_lines=list(manifest_lines))
+            _PdfPageSpec(
+                is_cover=True,
+                manifest_lines=list(detail_lines),
+                logo_rect=_cover_logo_rect(),
+                qr_width=qr_width,
+                qr_height=qr_height,
+                qr_deflate=qr_deflate,
+            )
         )
 
     def add_frame_page(
@@ -1339,26 +1533,27 @@ class RawPdfWriter:
 
     def build(self) -> bytes:
         # Object numbering: 1 Catalog, 2 Pages, 3 Helvetica, 4 Helvetica-Bold,
-        # 5 the shared RGB logo XObject (only when the document has frame
-        # pages), then per page: Page, Contents, and (frame pages only)
-        # the code image XObject.
+        # 5 the shared RGB logo XObject (the cover and every frame page
+        # draw it), then per page: Page, Contents, and one image XObject
+        # (the cover's QR, or the frame's code image).
         n = len(self._pages)
-        has_logo = any(not page.is_cover for page in self._pages)
+        has_logo = any(page.logo_rect is not None for page in self._pages)
         logo_obj = 5 if has_logo else 0
         page_obj: list[int] = []
         content_obj: list[int] = []
-        image_obj: list[int] = []  # 0 on the cover (no image)
+        image_obj: list[int] = []  # 0 when the page has no image
         nxt = 6 if has_logo else 5
         for page in self._pages:
             page_obj.append(nxt)
             nxt += 1
             content_obj.append(nxt)
             nxt += 1
-            if page.is_cover:
-                image_obj.append(0)
-            else:
+            has_image = bool(page.qr_deflate) if page.is_cover else bool(page.image_deflate)
+            if has_image:
                 image_obj.append(nxt)
                 nxt += 1
+            else:
+                image_obj.append(0)
 
         out = bytearray()
         offsets: list[int] = []
@@ -1403,7 +1598,12 @@ class RawPdfWriter:
                     f"[0 0 {_pdf_num(COVER_PAGE_WIDTH)} "
                     f"{_pdf_num(COVER_PAGE_HEIGHT)}]"
                 )
-                xobjects = ""
+                parts = []
+                if image_obj[i]:
+                    parts.append(f"/ImQR {image_obj[i]} 0 R")
+                if logo_obj:
+                    parts.append(f"/Im1 {logo_obj} 0 R")
+                xobjects = f" /XObject << {' '.join(parts)} >>" if parts else ""
             else:
                 mediabox = (
                     f"[0 0 {_pdf_num(CODE_PAGE_WIDTH)} "
@@ -1429,18 +1629,30 @@ class RawPdfWriter:
                 + compressed
                 + b"\nendstream"
             )
-            if page.is_cover:
+            if not image_obj[i]:
                 continue
+            if page.is_cover:
+                img_w, img_h, img_deflate = (
+                    page.qr_width,
+                    page.qr_height,
+                    page.qr_deflate,
+                )
+            else:
+                img_w, img_h, img_deflate = (
+                    page.image_width,
+                    page.image_height,
+                    page.image_deflate,
+                )
             add_object(
                 (
                     f"<< /Type /XObject /Subtype /Image "
-                    f"/Width {page.image_width} /Height {page.image_height} "
+                    f"/Width {img_w} /Height {img_h} "
                     f"/BitsPerComponent 1 /ColorSpace /DeviceGray "
                     f"/Filter /FlateDecode "
-                    f"/Length {len(page.image_deflate)} >>\n"
+                    f"/Length {len(img_deflate)} >>\n"
                 ).encode("ascii")
                 + b"stream\n"
-                + page.image_deflate
+                + img_deflate
                 + b"\nendstream"
             )
 
@@ -1534,27 +1746,37 @@ def build_pdf(
     out_path: str,
     dark: bool = False,
 ) -> PdfStats:
-    """Assemble the encoded PDF: 1 portrait cover page + 1 landscape
-    full-bleed code page per frame. [dark] inverts the code pixels and
-    paints each code page's background black. Returns page count and file
-    size (the 5-20 MB-per-GB band is checked by the caller against the
+    """Assemble the encoded PDF: 1 landscape branded cover page + 1
+    landscape full-bleed code page per frame. [dark] inverts the code
+    pixels and paints each code page's background black; the cover
+    stays LIGHT in both variants. Returns page count and file size
+    (the 5-20 MB-per-GB band is checked by the caller against the
     original size)."""
     stats = result.stats
     writer = RawPdfWriter()
 
-    # --- Cover page (unchanged: portrait, manifest text) ---
+    # --- Cover page (landscape, branded): details ONLY — file name,
+    # original size, code format, theme, page count. NO SHA-256, NO
+    # encoded payload size, NO ratio, NO frame/group counts, NO decode
+    # instructions, NO manifest grid: those live in the frame headers
+    # encoded in the code pages. Plus the real scannable QR. Long file
+    # names are truncated (mirrors Dart) so the line cannot run into
+    # the QR.
+    qr_grid = cover_qr_grid_with_quiet()
+    name = file_name if len(file_name) <= 80 else file_name[:77] + "..."
     lines = [
-        f"File: {file_name}",
+        f"File: {name}",
         f"Original size: {stats.original_size:,} bytes",
-        f"Encoded payload: {stats.compressed_size:,} bytes",
-        f"Ratio: {stats.ratio:.1f}x",
-        f"SHA-256: {stats.sha256_hex}",
-        f"Frames: {stats.frame_count} "
-        f"({stats.group_count} group(s) of 6 DATA + 2 PARITY)",
         f"Format: {'Barcode' if result.barcode else 'QR-style grid'}",
-        "Decode with the Middle Out app — scan the frames in order.",
+        f"Theme: {'Dark' if dark else 'Light'}",
+        f"Pages: {1 + len(result.frames)}",
     ]
-    writer.add_cover_page(lines)
+    writer.add_cover_page(
+        lines,
+        qr_deflate=deflate_1bit(qr_grid),
+        qr_width=len(qr_grid[0]),
+        qr_height=len(qr_grid),
+    )
 
     # --- One landscape full-bleed code page per frame ---
     for frame in result.frames:
@@ -1592,7 +1814,7 @@ def build_pdf(
 # image encoding is an implementation detail — the golden old-format
 # fixtures are 8-bit RGB XObjects from the pre-RawPdfWriter builder.
 # Anything it cannot parse is skipped, never guessed: a blob is only
-# returned when it parses as a valid frame, so the cover manifest grid
+# returned when it parses as a valid frame, so the cover's scannable QR
 # and alpha masks fall away harmlessly. When a 1-bit image exists the
 # RGB logo tile is never attempted at all (the 1-bit images are the
 # codes); only when no 1-bit image exists (old-format PDFs) is every
@@ -1825,8 +2047,8 @@ def _invert_matrix(matrix: list[bytearray]) -> list[bytearray]:
 
 def _is_frame(blob: bytes) -> bool:
     """True when [blob] parses as a Middle Out frame (magic + header CRC).
-    The cover manifest grid parses to text and fails here, so it is
-    skipped rather than treated as a frame."""
+    The cover QR parses to QR data and fails here, so it is skipped
+    rather than treated as a frame."""
     # Pre-filter on the SMALLEST header (v1, 97 bytes): a v1 frame with
     # an empty payload is only 101 bytes, and the real validation happens
     # in Frame.from_bytes below.
@@ -1931,7 +2153,7 @@ def _try_parse_code(matrix: list[bytearray], width: int, height: int) -> bytes |
         blob = _try_parse_grid_matrix(matrix)
         if blob is not None:
             return blob
-    # 4. Square grid (old format / cover manifest): quiet zone of
+    # 4. Square grid (old format): quiet zone of
     # 4 modules (fall back to 0).
     if width == height:
         for quiet in (GRID_QUIET_MODULES, 0):

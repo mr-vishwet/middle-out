@@ -5,7 +5,8 @@ import 'frame.dart';
 
 /// The visual codes: a Middle Out Code grid (2D) and a stacked-row barcode.
 ///
-/// A real ISO QR code holds ~3 KB; a Middle Out frame holds up to 64 KiB,
+/// A real ISO QR code holds ~3 KB; a Middle Out frame holds up to tens
+/// of MB (equal-split encodes divide the stream into at most 20 chunks),
 /// so the 2D mode is a custom grid — QR-style finders, timing patterns and
 /// a centre tile reserved for the logo — rather than an ISO QR code.
 /// Barcode mode draws the same grid stretched 4x wide, so the modules
@@ -15,7 +16,8 @@ import 'frame.dart';
 ///
 /// Grids are RECTANGULAR (w x h), matching the A4 landscape code page:
 /// the QR grid's aspect is the page aspect (841.89/595.28), the bar-grid's
-/// is 4x that. The cover manifest grid stays square (aspect 1.0).
+/// is 4x that. Old square grids (aspect 1.0) still parse through the
+/// same path.
 ///
 /// Both formats carry a 4-byte big-endian length prefix so the parser knows
 /// where the payload ends and the padding begins. Geometry mirrors
@@ -29,8 +31,14 @@ class CodeGrid {
   /// Grid height grows in steps of this many modules.
   static const int step = 2;
 
-  /// Quiet-zone width around the grid, in modules. Only the cover
-  /// manifest grid still carries one — code pages are full-bleed.
+  /// Largest grid height in modules. A 5 MB frame needs h ~ 5,450 and a
+  /// 50 MB frame h ~ 16,800 (QR aspect); 32,768 covers a ~190 MB frame
+  /// at QR aspect. Mirrors the Python reference's cap.
+  static const int maxHeight = 32768;
+
+  /// Quiet-zone width around a grid, in modules. Code pages are
+  /// full-bleed (no quiet zone); the cover QR keeps one — a QR without
+  /// a quiet zone fails to scan.
   static const int quietModules = 4;
 
   /// Payload bytes carried by one (old) barcode row.
@@ -58,9 +66,8 @@ class CodeGrid {
 
   /// (startRow, startCol, tileW, tileH) of the logo tile, centred.
   ///
-  /// Square grids (w == h — the cover manifest grid and old-format
-  /// grids): the OLD rule, unchanged — side = max(8, n ~/ 4) — so old
-  /// square goldens stay byte-identical.
+  /// Square grids (w == h — old-format grids): the OLD rule, unchanged
+  /// — side = max(8, n ~/ 4) — so old square goldens stay byte-identical.
   ///
   /// Landscape grids (QR and bar-grid): the tile is square AS DRAWN (in
   /// points on the landscape page), so its module counts differ by axis:
@@ -146,7 +153,7 @@ class CodeGrid {
       final w = max(minSize, (h * aspect).round());
       if (gridCapacityBits(w, h) >= needBits) return (w, h);
       h += step;
-      if (h > 4096) {
+      if (h > maxHeight) {
         throw const CodecException('payload too large for a single code grid');
       }
     }
@@ -154,8 +161,8 @@ class CodeGrid {
 
   /// Renders [payload] into a w x h module matrix at the given [aspect]
   /// (default the QR page aspect). Square grids (aspect 1.0) use the
-  /// same layout rules, so the cover manifest grid and old square grids
-  /// are the same format, not a special case.
+  /// same layout rules, so old square grids are the same format, not a
+  /// special case.
   static List<Uint8List> buildGrid(
     Uint8List payload, {
     double aspect = qrAspect,

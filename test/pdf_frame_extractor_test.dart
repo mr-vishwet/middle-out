@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:middle_out/codec/code_grid.dart';
+import 'package:middle_out/codec/cover_qr.dart';
 import 'package:middle_out/codec/encoder.dart';
 import 'package:middle_out/codec/frame.dart';
 import 'package:middle_out/codec/logo_tile.dart';
@@ -242,11 +243,32 @@ void main() {
     });
 
     test('skips the cover manifest grid (text, not a frame)', () {
+      // Old-format PDFs carry a manifest grid on the cover; it parses
+      // to text, not a frame, and must be skipped.
       final manifest = Uint8List.fromList(
         utf8.encode('File: demo.txt\nSHA-256: abc123'),
       );
       final pixels = gridPixels(manifest);
       final pdf = fixturePdf(pixels, pixels[0].length, pixels.length);
+      final extraction = PdfFrameExtractor.extract(pdf);
+      expect(extraction.imagesFound, 1);
+      expect(extraction.frames, isEmpty);
+    });
+
+    test('skips the cover QR (a real QR code, not a frame)', () {
+      // The new cover's QR (29x29 + 4-module quiet zone = 37x37) is a
+      // real ISO QR code: it must never be mistaken for a frame.
+      final qr = CoverQr.modules;
+      const quiet = CodeGrid.quietModules;
+      const size = CoverQr.size + 2 * quiet;
+      final pixels = List<Uint8List>.generate(
+        size,
+        (_) => Uint8List(size),
+      );
+      for (var r = 0; r < CoverQr.size; r++) {
+        pixels[r + quiet].setAll(quiet, qr[r]);
+      }
+      final pdf = fixturePdf(pixels, size, size);
       final extraction = PdfFrameExtractor.extract(pdf);
       expect(extraction.imagesFound, 1);
       expect(extraction.frames, isEmpty);

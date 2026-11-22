@@ -21,7 +21,10 @@ typedef StreamingProgress = void Function(double fraction, String label);
 ///    incrementally (ChaCha20, 64-byte block aligned) and written to a
 ///    temp file, which is deleted afterwards.
 /// 2. Read the temp file back in [maxPayload] chunks and frame it with
-///    [Encoder.buildFrames] — identical framing to the in-memory path.
+///    [Encoder.buildFrames] — the same framing, headers and parity
+///    layout as the in-memory path, but fixed-size chunks (the total is
+///    not known upfront, so the in-memory equal split does not apply)
+///    and no equal-split flag.
 ///
 /// Peak memory is bounded by the chunk size plus one frame, not the file
 /// size. The PDF assembly afterwards ([PdfDocument.build]) still holds

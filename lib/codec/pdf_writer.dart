@@ -5,7 +5,7 @@ import 'package:archive/archive.dart';
 
 import 'code_grid.dart';
 
-/// Minimal PDF writer for encoded Middle Out documents: 1 portrait cover
+/// Minimal PDF writer for encoded Middle Out documents: 1 LANDSCAPE cover
 /// page + 1 LANDSCAPE full-bleed code page per frame.
 ///
 /// Why hand-rolled: the `pdf` package has no public API for a 1-bit image
@@ -37,24 +37,31 @@ import 'code_grid.dart';
 /// background rect first and carry inverted 1-bit pixels (inverted by
 /// the caller at deflate time); the logo tile is the same in both themes.
 ///
+/// The cover is landscape too (same A4 size as the code pages): logo tile
+/// + "MIDDLE OUT" wordmark, file details only (name, original size,
+/// format, theme, page count — no SHA-256, payload size, ratio or frame
+/// counts; those live in the frame headers), and a real scannable QR code
+/// to the Middle Out web app, drawn as a 1-bit image XObject with its
+/// quiet zone. The cover stays light in both variants.
+///
 /// Validated against a real parser (poppler `pdfinfo`/`pdftotext` read
 /// the output: correct page count, A4 size, extractable text) and by the
 /// round-trip tests in `pdf_build_roundtrip_test.dart`.
 class RawPdfWriter {
-  /// A4 portrait page width in points (cover pages).
-  static const double pageWidth = 595.28;
-
-  /// A4 portrait page height in points (cover pages).
-  static const double pageHeight = 841.89;
-
-  /// A4 landscape page width in points (code pages).
+  /// A4 landscape page width in points (cover and code pages).
   static const double landscapeWidth = 841.89;
 
-  /// A4 landscape page height in points (code pages).
+  /// A4 landscape page height in points (cover and code pages).
   static const double landscapeHeight = 595.28;
 
-  /// Side of the cover manifest grid image, in points.
-  static const double coverGridSize = 180;
+  /// Side of the cover QR image, in points.
+  static const double coverQrSize = 180;
+
+  /// Side of the logo tile on the cover, in points.
+  static const double coverLogoSize = 64;
+
+  /// Cover margin, in points.
+  static const double coverMargin = 48;
 
   /// Creates a writer. [logoDeflate] is the zlib-compressed RGB pixels
   /// of the logo tile ([logoWidth] x [logoHeight], predictor 1); when
@@ -77,19 +84,21 @@ class RawPdfWriter {
 
   final _pages = <_RawPdfPage>[];
 
-  /// Adds the cover page: title, subtitle, [manifestLines], the manifest
-  /// grid image ([imageWidth] x [imageHeight], [imageDeflate] is the
-  /// zlib-compressed packed 1-bit pixels, predictor 1), and the scan
-  /// caption underneath it.
+  /// Adds the cover page: logo tile, "MIDDLE OUT" wordmark, [detailLines]
+  /// (file name, original size, format, theme, page count — nothing
+  /// else), and the scannable cover QR ([imageWidth] x [imageHeight]
+  /// modules including its quiet zone, [imageDeflate] the
+  /// zlib-compressed packed 1-bit pixels, predictor 1) with the scan
+  /// caption underneath it. Always light, in both themes.
   void addCoverPage({
-    required List<String> manifestLines,
+    required List<String> detailLines,
     required int imageWidth,
     required int imageHeight,
     required Uint8List imageDeflate,
   }) {
     _pages.add(
       _RawPdfPage.cover(
-        manifestLines: manifestLines,
+        detailLines: detailLines,
         imageWidth: imageWidth,
         imageHeight: imageHeight,
         imageDeflate: imageDeflate,
@@ -122,9 +131,9 @@ class RawPdfWriter {
   /// Pages added so far (cover + frames).
   int get pageCount => _pages.length;
 
-  /// True when the document carries frame pages and a logo to draw.
-  bool get _hasLogo =>
-      _logoDeflate != null && _pages.any((page) => !page.isCover);
+  /// True when the document carries pages and a logo to draw (the cover
+  /// and every frame page draw the tile from one shared XObject).
+  bool get _hasLogo => _logoDeflate != null && _pages.isNotEmpty;
 
   /// Serialises the document. Pure byte concatenation plus the xref
   /// table — no pixel work happens here.
@@ -189,10 +198,8 @@ class RawPdfWriter {
     for (var i = 0; i < n; i++) {
       final page = _pages[i];
       final (_, contentObj, imageObj) = pageObjs[i];
-      final mediaBox = page.isCover
-          ? '[0 0 $pageWidth $pageHeight]'
-          : '[0 0 $landscapeWidth $landscapeHeight]';
-      final xobjects = page.isCover || logoObj == null
+      const mediaBox = '[0 0 $landscapeWidth $landscapeHeight]';
+      final xobjects = logoObj == null
           ? '/Im0 $imageObj 0 R'
           : '/Im0 $imageObj 0 R /Im1 $logoObj 0 R';
       addObject(
@@ -263,13 +270,13 @@ class RawPdfWriter {
 /// One page of the encoded PDF: a 1-bit image plus text operators.
 class _RawPdfPage {
   _RawPdfPage.cover({
-    required this.manifestLines,
+    required this.detailLines,
     required this.imageWidth,
     required this.imageHeight,
     required this.imageDeflate,
   }) : isCover = true,
        dark = false,
-       caption = 'Scan with the Middle Out app to verify this file.';
+       caption = 'Scan to open the Middle Out app.';
 
   _RawPdfPage.frame({
     required this.imageWidth,
@@ -277,14 +284,14 @@ class _RawPdfPage {
     required this.imageDeflate,
     required this.dark,
   }) : isCover = false,
-       manifestLines = const [],
+       detailLines = const [],
        caption = '';
 
   /// True for the cover page.
   final bool isCover;
 
-  /// Cover manifest lines (empty on frame pages).
-  final List<String> manifestLines;
+  /// Cover detail lines (empty on frame pages).
+  final List<String> detailLines;
 
   /// Image width in pixels.
   final int imageWidth;
@@ -306,24 +313,27 @@ class _RawPdfPage {
   Uint8List contentOperators({required bool hasLogo}) {
     final buf = StringBuffer();
     if (isCover) {
-      buf.write(_text('MIDDLE OUT', 34, 48, 750, bold: true));
-      buf.write(_text('Lossless file, printed as code.', 13, 48, 720));
-      var y = 680.0;
-      for (final line in manifestLines) {
-        buf.write(_text(line, 11, 48, y));
-        y -= 19;
+      // Landscape cover: logo tile + wordmark top-left, file details
+      // below them, scannable QR on the right with its caption.
+      const margin = RawPdfWriter.coverMargin;
+      const pageW = RawPdfWriter.landscapeWidth;
+      const pageH = RawPdfWriter.landscapeHeight;
+      const logoSide = RawPdfWriter.coverLogoSize;
+      if (hasLogo) {
+        buf.write(_logoOpAt(margin, pageH - margin - logoSide, logoSide));
       }
-      final gridY = y - 24 - RawPdfWriter.coverGridSize;
-      buf.write(
-        _imageOp(
-          RawPdfWriter.coverGridSize,
-          RawPdfWriter.coverGridSize,
-          (RawPdfWriter.pageWidth - RawPdfWriter.coverGridSize) / 2,
-          gridY,
-          '/Im0',
-        ),
-      );
-      buf.write(_textCentred(caption, 10, gridY - 16));
+      buf.write(_text('MIDDLE OUT', 34, margin + logoSide + 16, 505, bold: true));
+      buf.write(_text('Lossless file, printed as code.', 13, margin + logoSide + 16, 478));
+      var y = 420.0;
+      for (final line in detailLines) {
+        buf.write(_text(line, 11, margin, y));
+        y -= 20;
+      }
+      const qrSize = RawPdfWriter.coverQrSize;
+      const qrX = pageW - margin - qrSize;
+      const qrY = (pageH - qrSize) / 2;
+      buf.write(_imageOp(qrSize, qrSize, qrX, qrY, '/Im0'));
+      buf.write(_textCentredAt(caption, 10, qrY - 16, qrX + qrSize / 2));
     } else {
       // Full-bleed: the code image spans the entire landscape page.
       if (dark) {
@@ -359,7 +369,6 @@ class _RawPdfPage {
   /// off-square. Drawing it stretched to the full tile rect would
   /// distort the M, and drawing it wider than the reserved tile would
   /// cover live data modules.
-  /// A rounded-rectangle clip gives the tile its rounded corners.
   String _logoOp() {
     final (r0, c0, tileW, tileH) =
         CodeGrid.centreTile(imageWidth, imageHeight);
@@ -371,6 +380,13 @@ class _RawPdfPage {
     final x = c0 / imageWidth * pageW + (tileWPt - logoSide) / 2;
     final tileBottom = pageH - (r0 + tileH) / imageHeight * pageH;
     final y = tileBottom + (tileHPt - logoSide) / 2;
+    return _logoOpAt(x, y, logoSide);
+  }
+
+  /// The logo tile as a [side]-point square at ([x], [y]), inside a
+  /// rounded-rectangle clip so the tile keeps its rounded corners.
+  /// Shared by the cover (fixed position) and frame pages ([_logoOp]).
+  static String _logoOpAt(double x, double y, double logoSide) {
     final r = logoSide * 0.2;
     // Rounded-rectangle clip path (bezier corners, kappa = 0.5523),
     // then the logo image inside the same q...Q block.
@@ -428,9 +444,9 @@ class _RawPdfPage {
       'BT /${bold ? 'F2' : 'F1'} ${_num(size)} Tf '
       '${_num(x)} ${_num(y)} Td (${_escape(s)}) Tj ET\n';
 
-  static String _textCentred(String s, double size, double y) {
+  static String _textCentredAt(String s, double size, double y, double centerX) {
     final w = _stringWidth(s, size);
-    return _text(s, size, (RawPdfWriter.pageWidth - w) / 2, y);
+    return _text(s, size, centerX - w / 2, y);
   }
 
   /// Helvetica string width in points, from the standard AFM metrics.
@@ -449,8 +465,8 @@ class _RawPdfPage {
   /// PDF literal-string escaping: backslash, parens; chars outside
   /// printable ASCII / WinAnsi 160-255 become '?' unless they have a
   /// WinAnsi mapping below. The middle dot in frame captions (U+00B7)
-  /// is WinAnsi 0xB7 and passes through; the em-dash in the cover
-  /// manifest (U+2014) maps to WinAnsi 0x97.
+  /// is WinAnsi 0xB7 and passes through; an em-dash in a file name
+  /// (U+2014) maps to WinAnsi 0x97.
   static String _escape(String s) {
     final buf = StringBuffer();
     // Runes, not codeUnits: an astral char (e.g. an emoji) is one rune
@@ -471,7 +487,7 @@ class _RawPdfPage {
   }
 
   /// Common punctuation mapped to its WinAnsi (cp1252) byte, so file
-  /// names and the cover manifest keep their dashes and quotes instead
+  /// names and cover details keep their dashes and quotes instead
   /// of degrading to '?'.
   static const Map<int, int> _winAnsiPunctuation = {
     0x20AC: 0x80, // Euro sign

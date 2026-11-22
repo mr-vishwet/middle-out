@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 
+import '../codec/erasure.dart';
 import '../codec/frame.dart';
 import '../core/constants.dart';
 
@@ -31,13 +32,15 @@ class FrameInspection {
     required this.recoveredViaParity,
   });
 
-  /// Total frames in the encode (data + parity).
+  /// Total frames in the encode (data + parity). Parity counts one per
+  /// non-empty trio — a trailing group with <= 3 data frames has no
+  /// second parity — so this is NOT `totalData + groups * 2`.
   final int totalFrames;
 
   /// Total DATA frames in the encode.
   final int totalDataFrames;
 
-  /// Total 8-frame groups in the encode.
+  /// Total parity groups in the encode (up to 8 frames each).
   final int totalGroups;
 
   /// Valid DATA frames present.
@@ -97,8 +100,8 @@ class FrameInspection {
   int get readableFrames => presentData + presentParity;
 
   /// Payload bytes the parity rebuild restores (approximate: missing and
-  /// corrupt data frames carry up to [kDefaultMaxPayload] each; the
-  /// exact count is known only after decode).
+  /// corrupt data frames carry up to one chunk each — the chunk size
+  /// varies by encode; the exact count is known only after decode).
   int get damagedFrameCount =>
       missingDataIndices.length + corruptDataIndices.length;
 }
@@ -199,8 +202,17 @@ class FrameInspector {
     final shaHex = meta.originalSha256
         .map((b) => b.toRadixString(16).padLeft(2, '0'))
         .join();
+    // Expected total under the current skip rule (one parity per
+    // non-empty trio), but never less than the frames actually present:
+    // PDFs encoded before the skip rule carry an empty second parity
+    // that still counts as a frame of that encode.
+    final expectedTotal =
+        totalData + Erasure.parityFrameCount(totalData);
+    final presentTotal =
+        presentData + presentParity + corruptParity.length;
     return FrameInspection(
-      totalFrames: totalData + totalGroups * kGroupParityFrames,
+      totalFrames:
+          expectedTotal > presentTotal ? expectedTotal : presentTotal,
       totalDataFrames: totalData,
       totalGroups: totalGroups,
       presentData: presentData,

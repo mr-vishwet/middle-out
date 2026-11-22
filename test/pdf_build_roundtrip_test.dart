@@ -5,13 +5,16 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:middle_out/codec/code_grid.dart';
 import 'package:middle_out/codec/decoder.dart';
 import 'package:middle_out/codec/encoder.dart';
 import 'package:middle_out/codec/pdf_document.dart';
+import 'package:middle_out/codec/pdf_writer.dart';
+import 'package:middle_out/codec/png_encode.dart';
 import 'package:middle_out/services/pdf_frame_extractor.dart';
 
-/// Incompressible bytes: 200 KiB of seeded random data encodes to 4 data
-/// frames (64 KiB payload each) + parity, enough to exercise the builder.
+/// Incompressible bytes: 200 KiB of seeded random data encodes to 4 equal
+/// ~50 KiB data frames + 2 parity, enough to exercise the builder.
 Uint8List randomBytes(int length) {
   final random = Random(42);
   return Uint8List.fromList(
@@ -60,15 +63,15 @@ void main() {
 
         // New format: 1-bit DeviceGray code XObjects plus ONE shared 8-bit
         // RGB logo XObject; no SMask, no nested DecodeParms dict (the
-        // extractor's scan requires that). Cover portrait, code pages
-        // landscape.
+        // extractor's scan requires that). Cover and code pages are ALL
+        // landscape — no portrait page anywhere.
         expect(bytesContain(pdf, '/BitsPerComponent 1'), isTrue);
         expect(bytesContain(pdf, '/ColorSpace /DeviceGray'), isTrue);
         expect(bytesContain(pdf, '/BitsPerComponent 8'), isTrue);
         expect(bytesContain(pdf, '/ColorSpace /DeviceRGB'), isTrue);
         expect(bytesContain(pdf, '/SMask'), isFalse);
         expect(bytesContain(pdf, '/DecodeParms'), isFalse);
-        expect(bytesContain(pdf, '/MediaBox [0 0 595.28 841.89]'), isTrue);
+        expect(bytesContain(pdf, '/MediaBox [0 0 595.28 841.89]'), isFalse);
         expect(bytesContain(pdf, '/MediaBox [0 0 841.89 595.28]'), isTrue);
 
         final extraction = PdfFrameExtractor.extract(pdf);
@@ -185,6 +188,56 @@ void main() {
         passphrase: 'test-passphrase',
       );
       expect(decoded, data);
+    });
+
+    test('cover-stripped PDF still decodes (decoder never reads the cover)',
+        () async {
+      // A PDF built with NO cover page at all — frame pages only —
+      // decodes identically, proving no decode input comes from the
+      // cover (the old manifest text is gone for good).
+      final data = randomBytes(100 * 1024);
+      final encoded = Encoder.encode(data);
+      final writer = RawPdfWriter();
+      for (final frame in encoded.frames) {
+        final grid = CodeGrid.buildFrameGrid(
+          frame.toBytes(),
+          barcode: encoded.barcode,
+        );
+        writer.addFramePage(
+          imageWidth: grid[0].length,
+          imageHeight: grid.length,
+          imageDeflate: PngEncode.deflate1Bit(
+            grid,
+            grid[0].length,
+            grid.length,
+          ),
+        );
+      }
+      final pdf = writer.build();
+      final extraction = PdfFrameExtractor.extract(pdf);
+      expect(extraction.frames.length, encoded.frames.length);
+      expect(Decoder.decode(extraction.frames), data);
+    });
+
+    test('every code page is dense (equal split, no sparse pages)', () async {
+      final data = randomBytes(200 * 1024);
+      final encoded = Encoder.encode(data);
+      // 4 equal data frames + 2 parity: every data frame carries the
+      // full chunk size, so no page renders a tiny grid.
+      final dataFrames = [
+        for (final f in encoded.frames)
+          if (f.isData) f,
+      ];
+      expect(dataFrames.length, 4);
+      final chunkSize = (encoded.stats.compressedSize + 3) ~/ 4;
+      for (final frame in dataFrames) {
+        expect(frame.payload.length, chunkSize);
+      }
+      final (pdf, stats) = await PdfDocument.build(encoded, 'dense.bin');
+      expect(stats.pages, 1 + encoded.frames.length);
+      final extraction = PdfFrameExtractor.extract(pdf);
+      expect(extraction.frames.length, encoded.frames.length);
+      expect(Decoder.decode(extraction.frames), data);
     });
   });
 

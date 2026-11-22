@@ -27,41 +27,61 @@ Uint8List _mixedBytes() {
 
 void main() {
   group('EncodeController.estimateFor', () {
-    test('hero case (1.04 GB at 73x) is ~292 frames, under cap', () {
+    test('hero case (1.04 GB at 73x) is 27 frames, under cap', () {
+      // Equal split caps the in-memory path at 20 data + 7 parity.
       final estimate = EncodeController.estimateFor(
         fileSize: 1040000000,
         ratio: 73,
         sampleBytes: 768 * 1024,
       );
-      expect(estimate.estimatedFrames, 292);
+      expect(estimate.estimatedFrames, 27);
       expect(estimate.overCap, isFalse);
     });
 
-    test('300 MB incompressible is over cap', () {
+    test('300 MB incompressible is 27 frames in memory, over cap streamed',
+        () {
       final estimate = EncodeController.estimateFor(
         fileSize: 300 * 1024 * 1024,
         ratio: 1.0,
         sampleBytes: 768 * 1024,
       );
-      expect(estimate.estimatedFrames, 6400);
-      expect(estimate.overCap, isTrue);
+      expect(estimate.estimatedFrames, 27);
+      expect(estimate.overCap, isFalse);
+      // Streaming uses fixed 64 KiB chunks, so it CAN exceed the cap.
+      final streamed = EncodeController.estimateFor(
+        fileSize: 300 * 1024 * 1024,
+        ratio: 1.0,
+        sampleBytes: 768 * 1024,
+        streaming: true,
+      );
+      expect(streamed.estimatedFrames, 6400);
+      expect(streamed.overCap, isTrue);
       expect(
-        EncodeController.capAdvice(estimate.estimatedFrames),
+        EncodeController.capAdvice(streamed.estimatedFrames),
         allOf(contains('6400'), contains('Split')),
       );
     });
 
     test('67 MB mp4 at its real ratio is under the new cap', () {
       // The reported file needed 1,125 frames (~55 MB compressed, so a
-      // ratio of ~1.27); the cap is 4,096.
+      // ratio of ~1.27); the cap is 4,096. In memory it equal-splits
+      // to 27 frames; streamed it frames to ~1,127.
       final estimate = EncodeController.estimateFor(
         fileSize: 67 * 1024 * 1024,
         ratio: 1.27,
         sampleBytes: 768 * 1024,
       );
-      expect(estimate.estimatedFrames, greaterThan(1000));
-      expect(estimate.estimatedFrames, lessThan(4096));
+      expect(estimate.estimatedFrames, 27);
       expect(estimate.overCap, isFalse);
+      final streamed = EncodeController.estimateFor(
+        fileSize: 67 * 1024 * 1024,
+        ratio: 1.27,
+        sampleBytes: 768 * 1024,
+        streaming: true,
+      );
+      expect(streamed.estimatedFrames, greaterThan(1000));
+      expect(streamed.estimatedFrames, lessThan(4096));
+      expect(streamed.overCap, isFalse);
     });
   });
 

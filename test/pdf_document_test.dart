@@ -1,20 +1,33 @@
+import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:middle_out/codec/decoder.dart';
 import 'package:middle_out/codec/encoder.dart';
 import 'package:middle_out/codec/pdf_document.dart';
 import 'package:middle_out/services/pdf_frame_extractor.dart';
 
-/// Incompressible bytes: 200 KiB of seeded random data encodes to 4 data
-/// frames (64 KiB payload each) + 2 parity = 8 frames, enough to observe
-/// per-frame progress.
+/// Incompressible bytes: 200 KiB of seeded random data encodes to 4 equal
+/// data frames + 2 parity = 6 frames, enough to observe per-frame progress.
 Uint8List randomBytes(int length) {
   final random = Random(42);
   return Uint8List.fromList(
     List<int>.generate(length, (_) => random.nextInt(256)),
   );
+}
+
+/// Extracts object [number]'s stream bytes (between 'stream\n' and
+/// '\nendstream') and inflates them (content streams are FlateDecode).
+Uint8List inflateObjectStream(Uint8List pdf, int number) {
+  final text = latin1.decode(pdf);
+  final header = text.indexOf('$number 0 obj');
+  expect(header, greaterThanOrEqualTo(0), reason: 'object $number missing');
+  final streamAt = text.indexOf('stream\n', header);
+  final endAt = text.indexOf('\nendstream', streamAt);
+  final stream = Uint8List.sublistView(pdf, streamAt + 7, endAt);
+  return Uint8List.fromList(const ZLibDecoder().decodeBytes(stream));
 }
 
 void main() {
@@ -89,10 +102,49 @@ void main() {
       final encoded = Encoder.encode(data);
       final (pdf, _) = await PdfDocument.build(encoded, 'roundtrip.bin');
       final extraction = PdfFrameExtractor.extract(pdf);
-      // The cover's manifest grid is not a frame — it must be skipped.
+      // The cover's QR is not a frame — it must be skipped.
       expect(extraction.frames.length, encoded.frames.length);
       final decoded = Decoder.decode(extraction.frames);
       expect(decoded, data);
+    });
+  });
+
+  group('PdfDocument.build cover', () {
+    test('cover carries details + QR, no secrets', () async {
+      final data = randomBytes(200 * 1024);
+      final encoded = Encoder.encode(data);
+      final (pdf, _) = await PdfDocument.build(encoded, 'cover-check.bin');
+      final text = latin1.decode(pdf);
+      // The cover QR image: 29 modules + 4 quiet each side = 37x37.
+      expect(text.contains('/Width 37 /Height 37'), isTrue);
+      // Cover content stream is object 7 (5 logo, 6 cover page).
+      final ops = latin1.decode(inflateObjectStream(pdf, 7));
+      expect(ops.contains('(MIDDLE OUT)'), isTrue);
+      expect(ops.contains('(File: cover-check.bin)'), isTrue);
+      expect(ops.contains('(Original size:'), isTrue);
+      expect(ops.contains('(Format: QR-style grid)'), isTrue);
+      expect(ops.contains('(Theme: Light)'), isTrue);
+      expect(ops.contains('(Pages: 7)'), isTrue);
+      expect(ops.contains('(Scan to open the Middle Out app.)'), isTrue);
+      // No secrets on the cover.
+      expect(ops.contains('SHA-256'), isFalse);
+      expect(ops.contains('Encoded payload'), isFalse);
+      expect(ops.contains('Ratio'), isFalse);
+      expect(ops.contains('Frames:'), isFalse);
+    });
+
+    test('dark PDF cover stays light', () async {
+      final data = randomBytes(100 * 1024);
+      final encoded = Encoder.encode(data);
+      final (pdf, _) = await PdfDocument.build(
+        encoded,
+        'dark-cover.bin',
+        dark: true,
+      );
+      final ops = latin1.decode(inflateObjectStream(pdf, 7));
+      expect(ops.contains('re f'), isFalse);
+      expect(ops.contains('(Theme: Dark)'), isTrue);
+      expect(ops.contains('(MIDDLE OUT)'), isTrue);
     });
   });
 }

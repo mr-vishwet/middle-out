@@ -32,8 +32,9 @@ class PdfExtraction {
 /// [PdfDocument]); this reader finds those XObjects, inflates the
 /// FlateDecode streams, samples the modules back out of the pixels, and
 /// returns the frame blobs — which then feed the normal [Decoder].
-/// The cover page's manifest grid parses to text, not a frame, and is
-/// skipped; only blobs with a valid frame header are kept.
+/// The cover page's QR code parses to nothing (it is a real ISO QR code,
+/// not a Middle Out grid) and is skipped; only blobs with a valid frame
+/// header are kept.
 ///
 /// Formats, identified by image aspect: new rectangular QR grids
 /// (w/h ~ 1.414) and bar-grids (w/h ~ 5.657), both full-bleed with no
@@ -346,8 +347,10 @@ class PdfFrameExtractor {
       final blob = _tryGrid(matrix, 0, 0, width, height);
       if (blob != null) return blob;
     }
-    // 4. Square grid (old format / cover manifest): quiet zone of
-    // 4 modules (fall back to 0).
+    // 4. Square grid (old format): quiet zone of 4 modules
+    // (fall back to 0). The cover QR is square too, but it is a real
+    // ISO QR code, not a Middle Out grid — it fails the frame check
+    // below and is skipped.
     if (width == height) {
       for (final quiet in [CodeGrid.quietModules, 0]) {
         final n = width - 2 * quiet;
@@ -504,8 +507,8 @@ class PdfFrameExtractor {
   }
 
   /// True when [blob] parses as a Middle Out frame (magic + header CRC).
-  /// The cover manifest grid parses to text and fails here, so it is
-  /// skipped rather than treated as a frame.
+  /// Anything else — an old cover manifest grid (text), the new cover
+  /// QR — fails here and is skipped rather than treated as a frame.
   static bool _isFrame(Uint8List blob) {
     // Pre-filter on the SMALLEST header (v1, 97 bytes): a v1 frame with
     // an empty payload is only 101 bytes, and the real validation happens

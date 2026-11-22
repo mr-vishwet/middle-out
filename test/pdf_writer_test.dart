@@ -48,7 +48,7 @@ void main() {
     test('builds a valid minimal PDF: header, catalog, xref, trailer', () {
       final writer = RawPdfWriter(logoDeflate: tinyLogoDeflate())
         ..addCoverPage(
-          manifestLines: const ['File: demo.bin', 'Frames: 1'],
+          detailLines: const ['File: demo.bin', 'Pages: 2'],
           imageWidth: 8,
           imageHeight: 8,
           imageDeflate: tinyDeflate(),
@@ -66,10 +66,12 @@ void main() {
       expect(text.contains('/Type /Catalog'), isTrue);
       expect(text.contains('/Type /Pages'), isTrue);
       expect(text.contains('/Count 2'), isTrue);
-      // Cover portrait, code page landscape.
-      expect(text.contains('/MediaBox [0 0 595.28 841.89]'), isTrue);
+      // Cover AND code pages are landscape — no portrait page anywhere.
+      expect(text.contains('/MediaBox [0 0 595.28 841.89]'), isFalse);
       expect(text.contains('/MediaBox [0 0 841.89 595.28]'), isTrue);
       expect(text.trimRight().endsWith('%%EOF'), isTrue);
+      // Both pages reference the shared logo XObject (object 5).
+      expect('/Im1 5 0 R'.allMatches(text).length, 2);
 
       // Xref table: every offset must point at its 'N 0 obj' header,
       // and startxref must point at the xref table itself.
@@ -227,10 +229,47 @@ void main() {
       expect(lightOps.contains('re f'), isFalse);
     });
 
-    test('cover page carries title, manifest lines and caption', () {
+    test('cover page carries branding, detail lines, QR and caption', () {
+      final writer = RawPdfWriter(logoDeflate: tinyLogoDeflate())
+        ..addCoverPage(
+          detailLines: const [
+            'File: demo.bin',
+            'Original size: 1.00 KB',
+            'Format: QR-style grid',
+            'Theme: Light',
+            'Pages: 2',
+          ],
+          imageWidth: 37,
+          imageHeight: 37,
+          imageDeflate: tinyDeflate(),
+        );
+      final pdf = writer.build();
+      // Cover content stream is object 7 (5 logo, 6 page, 7 contents).
+      final ops = latin1.decode(inflateObjectStream(pdf, 7));
+      expect(ops.contains('(MIDDLE OUT)'), isTrue);
+      expect(ops.contains('(Lossless file, printed as code.)'), isTrue);
+      expect(ops.contains('(File: demo.bin)'), isTrue);
+      expect(ops.contains('(Original size: 1.00 KB)'), isTrue);
+      expect(ops.contains('(Format: QR-style grid)'), isTrue);
+      expect(ops.contains('(Theme: Light)'), isTrue);
+      expect(ops.contains('(Pages: 2)'), isTrue);
+      // No secrets on the cover: no SHA, payload, ratio or frame counts.
+      expect(ops.contains('SHA'), isFalse);
+      expect(ops.contains('Encoded payload'), isFalse);
+      expect(ops.contains('Ratio'), isFalse);
+      expect(ops.contains('Frames:'), isFalse);
+      expect(ops.contains('(Scan to open the Middle Out app.)'), isTrue);
+      // QR image: 180pt square on the right, centred vertically.
+      expect(ops.contains('q 180 0 0 180 613.89 207.64 cm /Im0 Do Q'), isTrue);
+      // Logo tile top-left, 64pt, with its rounded-rect clip.
+      expect(ops.contains('64 0 0 64 48 483.28 cm /Im1 Do'), isTrue);
+      expect(ops.contains('W n'), isTrue);
+    });
+
+    test('cover without a logo draws no logo tile', () {
       final writer = RawPdfWriter()
         ..addCoverPage(
-          manifestLines: const ['File: demo.bin', 'SHA-256: abc123'],
+          detailLines: const ['File: demo.bin'],
           imageWidth: 8,
           imageHeight: 8,
           imageDeflate: tinyDeflate(),
@@ -238,19 +277,13 @@ void main() {
       final pdf = writer.build();
       final ops = latin1.decode(inflateObjectStream(pdf, 6));
       expect(ops.contains('(MIDDLE OUT)'), isTrue);
-      expect(ops.contains('(Lossless file, printed as code.)'), isTrue);
-      expect(ops.contains('(File: demo.bin)'), isTrue);
-      expect(ops.contains('(SHA-256: abc123)'), isTrue);
-      expect(
-        ops.contains('(Scan with the Middle Out app to verify this file.)'),
-        isTrue,
-      );
+      expect(ops.contains('/Im1 Do'), isFalse);
     });
 
-    test('manifest text escapes parens, backslashes and unicode', () {
+    test('detail text escapes parens, backslashes and unicode', () {
       final writer = RawPdfWriter()
         ..addCoverPage(
-          manifestLines: const [
+          detailLines: const [
             'File: (1) test \\ file \u{1F600} caf\u00e9',
           ],
           imageWidth: 8,
@@ -270,7 +303,7 @@ void main() {
     test('em-dash maps to its WinAnsi byte, not a question mark', () {
       final writer = RawPdfWriter()
         ..addCoverPage(
-          manifestLines: const ['Decode with the app \u2014 scan in order.'],
+          detailLines: const ['File: report \u2014 final.bin'],
           imageWidth: 8,
           imageHeight: 8,
           imageDeflate: tinyDeflate(),
@@ -280,7 +313,7 @@ void main() {
       // U+2014 em-dash -> WinAnsi 0x97.
       expect(ops.contains(0x97), isTrue);
       expect(
-        latin1.decode(ops).contains('Decode with the app ? scan in order.'),
+        latin1.decode(ops).contains('File: report ? final.bin'),
         isFalse,
       );
     });

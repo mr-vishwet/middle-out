@@ -151,8 +151,8 @@ void main() {
     });
 
     test('old square grids still parse', () {
-      // Square grids (aspect 1.0, the old format and the cover manifest
-      // grid) parse through the same rectangular code path.
+      // Square grids (aspect 1.0, the old format) parse through the
+      // same rectangular code path.
       for (final size in [0, 1, 1024, 16 * 1024, 64 * 1024]) {
         final raw = fixedBytes(size, 13);
         final grid = CodeGrid.buildGrid(raw, aspect: 1.0);
@@ -181,6 +181,28 @@ void main() {
         aspect: CodeGrid.barcodeAspect,
       );
       expect((fbw, fbh), (1776, 314));
+    });
+
+    test('chooseGridSize sizes big equal-split frames (cap 32768)', () {
+      // A 5 MB frame needs h ~ 5,450; a 50 MB frame h ~ 16,800 — both
+      // far above the old 4,096 cap. Sizing is pure arithmetic, so
+      // these checks cost nothing.
+      final (_, h5) = CodeGrid.chooseGridSize(5 * 1024 * 1024);
+      expect(h5, greaterThan(5000));
+      expect(h5, lessThan(6000));
+      final (_, h50) = CodeGrid.chooseGridSize(50 * 1024 * 1024);
+      expect(h50, greaterThan(15000));
+      expect(h50, lessThan(19000));
+      expect(h50, lessThanOrEqualTo(CodeGrid.maxHeight));
+    });
+
+    test('chooseGridSize throws past the cap', () {
+      // A 200 MB frame needs more than the 32,768-row cap allows
+      // (~181 MB at QR aspect).
+      expect(
+        () => CodeGrid.chooseGridSize(200 * 1024 * 1024),
+        throwsA(isA<Exception>()),
+      );
     });
   });
 
