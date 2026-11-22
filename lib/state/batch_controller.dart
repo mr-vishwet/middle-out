@@ -375,7 +375,18 @@ class BatchController extends ChangeNotifier {
           progressLabel: 'Building PDF…',
         ),
       );
-      final (pdf, stats) = await PdfDocument.build(encoded, item.name);
+      final (pdf, stats) = await PdfDocument.build(
+        encoded,
+        item.name,
+        onProgress: (fraction, label) {
+          _update(
+            items[index].copyWith(
+              progress: 0.85 + fraction * 0.15,
+              progressLabel: label,
+            ),
+          );
+        },
+      );
       _update(
         items[index].copyWith(
           status: BatchStatus.done,

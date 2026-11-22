@@ -180,6 +180,14 @@ class EncodeController extends ChangeNotifier {
   /// Called with the history record after a successful encode.
   Future<void> Function(HistoryRecord record)? onEncoded;
 
+  /// Generation of the in-flight encode. [reset] bumps it, so an encode
+  /// abandoned mid-flight (Cancel pops the screen and resets) cannot
+  /// finish late and flip the reset controller back to done, or record
+  /// history for an encode the user cancelled. [encode] captures its
+  /// generation at start and checks it between stages and inside the
+  /// PDF build (via its shouldCancel callback).
+  int _generation = 0;
+
   /// Warning when the PDF lands outside the 5–20 MB-per-GB band.
   String? get pdfBandWarning => result == null || pdfStats == null
       ? null
@@ -317,6 +325,7 @@ class EncodeController extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    final generation = ++_generation;
     phase = EncodePhase.encoding;
     error = null;
     progress = 0;
@@ -355,12 +364,24 @@ class EncodeController extends ChangeNotifier {
           },
         );
       }
+      // Cancelled (or reset) while the encode stages were running.
+      if (generation != _generation) return;
       progress = 0.85;
-      progressLabel = 'Building ${encoded.frames.length} frames…';
+      progressLabel = 'Building PDF…';
       notifyListeners();
       await Future<void>.delayed(Duration.zero);
 
-      final (bytes, stats) = await PdfDocument.build(encoded, current.name);
+      final (bytes, stats) = await PdfDocument.build(
+        encoded,
+        current.name,
+        onProgress: (fraction, label) {
+          progress = 0.85 + fraction * 0.15;
+          progressLabel = label;
+          notifyListeners();
+        },
+        shouldCancel: () => generation != _generation,
+      );
+      if (generation != _generation) return;
       result = encoded;
       pdfBytes = bytes;
       pdfStats = stats;
@@ -381,6 +402,10 @@ class EncodeController extends ChangeNotifier {
         createdAt: DateTime.now(),
       );
       await onEncoded?.call(record);
+    } on BuildCancelledException {
+      // Cancelled mid-build: the controller was already reset by the
+      // caller (Cancel / reset) — leave it alone, record nothing.
+      return;
     } on CodecException catch (e) {
       _fail(e.message);
     } catch (e) {
@@ -415,8 +440,11 @@ class EncodeController extends ChangeNotifier {
     }
   }
 
-  /// Resets the flow to idle (keeps the toggles and mode).
+  /// Resets the flow to idle (keeps the toggles and mode). Also
+  /// invalidates any in-flight encode, so a cancelled encode stops
+  /// at its next checkpoint instead of completing late.
   void reset() {
+    _generation++;
     phase = EncodePhase.idle;
     file = null;
     progress = 0;

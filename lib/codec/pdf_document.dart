@@ -20,6 +20,18 @@ class PdfStats {
   final int sizeBytes;
 }
 
+/// Thrown when PdfDocument.build is cancelled through its shouldCancel
+/// callback. Deliberately not a CodecException: callers treat a
+/// cancellation as "stop quietly", not as an error to show the user.
+/// The partial document is discarded.
+class BuildCancelledException implements Exception {
+  /// Creates a build-cancelled exception.
+  const BuildCancelledException();
+
+  @override
+  String toString() => 'Build cancelled';
+}
+
 /// Assembles the encoded PDF: 1 cover page + 1 full-page code page per
 /// frame, each frame embedded as a 1-bit image XObject.
 ///
@@ -37,10 +49,22 @@ class PdfDocument {
   static const int barcodeGapPx = 4;
 
   /// Builds the PDF bytes for [result] (the encode of [fileName]).
+  ///
+  /// Reports progress through [onProgress] — fraction 0..1 of the PDF
+  /// build plus a human-readable label ('Building PDF… page N of M') —
+  /// and yields to the event loop after every frame, so the UI can
+  /// repaint the progress bar and respond to taps (Cancel) during a
+  /// long build. Without the yields the whole build blocks the UI
+  /// thread and the bar sits pinned at its last value for minutes on
+  /// large files. When [shouldCancel] returns true the build stops
+  /// promptly by throwing [BuildCancelledException]. Neither callback
+  /// changes the PDF bytes: the loop body is untouched.
   static Future<(Uint8List, PdfStats)> build(
     EncodeResult result,
-    String fileName,
-  ) async {
+    String fileName, {
+    EncodeProgress? onProgress,
+    bool Function()? shouldCancel,
+  }) async {
     final doc = pw.Document();
     final stats = result.stats;
 
@@ -96,7 +120,9 @@ class PdfDocument {
     );
 
     // --- One full-page code page per frame ---
-    for (final frame in result.frames) {
+    final totalPages = 1 + result.frames.length;
+    for (var i = 0; i < result.frames.length; i++) {
+      final frame = result.frames[i];
       final raw = frame.toBytes();
       final Uint8List png;
       final double aspect;
@@ -136,8 +162,20 @@ class PdfDocument {
           ),
         ),
       );
+      onProgress?.call(
+        (i + 1) / result.frames.length,
+        'Building PDF… page ${i + 2} of $totalPages',
+      );
+      if (shouldCancel?.call() == true) {
+        throw const BuildCancelledException();
+      }
+      // Yield so the UI repaints the bar and Cancel taps get through —
+      // the per-frame work above is synchronous and would otherwise
+      // block the UI thread for the whole build.
+      await Future<void>.delayed(Duration.zero);
     }
 
+    onProgress?.call(1, 'Saving PDF…');
     final bytes = await doc.save();
     return (
       bytes,
