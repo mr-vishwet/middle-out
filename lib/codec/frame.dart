@@ -59,6 +59,35 @@ class Crc32 {
   }
 }
 
+/// Writes [value] as 8 big-endian bytes at [offset] in [data], using
+/// only [ByteData.setUint8].
+///
+/// ByteData.setUint64/getUint64 (and the Int64 pair) throw
+/// UnsupportedError under dart2js — JS numbers cannot hold 64-bit ints
+/// — so the codec must never call them: every web encode/decode goes
+/// through this helper and [readUint64BE] instead. The arithmetic is
+/// exact for all values below 2^53 (~9 PB), far above any file this app
+/// handles (100 GB native cap); dart2js cannot represent larger ints
+/// exactly anyway.
+void writeUint64BE(ByteData data, int offset, int value) {
+  var remaining = value;
+  for (var i = 7; i >= 0; i--) {
+    data.setUint8(offset + i, remaining % 256);
+    remaining ~/= 256;
+  }
+}
+
+/// Reads 8 big-endian bytes at [offset] in [data] as an unsigned
+/// 64-bit integer, using only [ByteData.getUint8]. See [writeUint64BE]
+/// for why the ByteData 64-bit accessors are banned from this codec.
+int readUint64BE(ByteData data, int offset) {
+  var value = 0;
+  for (var i = 0; i < 8; i++) {
+    value = value * 256 + data.getUint8(offset + i);
+  }
+  return value;
+}
+
 /// One Middle Out frame: a 100-byte v2 header + payload + 4-byte payload
 /// CRC.
 ///
@@ -159,8 +188,8 @@ class Frame {
     header.setUint16(12, totalGroups);
     header.setUint16(14, totalDataFrames);
     header.setUint32(16, payload.length);
-    header.setUint64(20, originalSize);
-    header.setUint64(28, compressedSize);
+    writeUint64BE(header, 20, originalSize);
+    writeUint64BE(header, 28, compressedSize);
     for (var i = 0; i < 32; i++) {
       header.setUint8(36 + i, originalSha256[i]);
     }
@@ -245,8 +274,8 @@ class Frame {
       totalGroups = header.getUint16(12);
       totalDataFrames = header.getUint16(14);
       payloadLength = header.getUint32(16);
-      originalSize = header.getUint64(20);
-      compressedSize = header.getUint64(28);
+      originalSize = readUint64BE(header, 20);
+      compressedSize = readUint64BE(header, 28);
       shaOffset = 36;
       saltOffset = 68;
       nonceOffset = 84;
@@ -259,8 +288,8 @@ class Frame {
       totalGroups = header.getUint8(10);
       totalDataFrames = header.getUint16(11);
       payloadLength = header.getUint32(13);
-      originalSize = header.getUint64(17);
-      compressedSize = header.getUint64(25);
+      originalSize = readUint64BE(header, 17);
+      compressedSize = readUint64BE(header, 25);
       shaOffset = 33;
       saltOffset = 65;
       nonceOffset = 81;

@@ -51,8 +51,8 @@ Uint8List v1FrameBytes({
   header.setUint8(10, totalGroups);
   header.setUint16(11, totalDataFrames);
   header.setUint32(13, payload.length);
-  header.setUint64(17, originalSize);
-  header.setUint64(25, compressedSize);
+  writeUint64BE(header, 17, originalSize);
+  writeUint64BE(header, 25, compressedSize);
   for (var i = 0; i < 32; i++) {
     header.setUint8(33 + i, sha256Bytes[i]);
   }
@@ -300,6 +300,107 @@ void main() {
           ),
         ),
       );
+    });
+  });
+
+  // ByteData.getUint64/setUint64 throw UnsupportedError under dart2js
+  // (JS numbers cannot hold 64-bit ints) — a real web encode of a
+  // 67 MB file hit exactly that. The codec now uses writeUint64BE /
+  // readUint64BE (byte loops) instead. VM tests cannot catch
+  // dart2js-only failures, so these tests assert the byte layout
+  // itself, including values above 2^32 where a 32-bit shortcut
+  // would silently corrupt the size fields.
+  group('uint64 header fields (dart2js-safe)', () {
+    test('writeUint64BE produces exact big-endian bytes', () {
+      final cases = <int, List<int>>{
+        0: [0, 0, 0, 0, 0, 0, 0, 0],
+        255: [0, 0, 0, 0, 0, 0, 0, 255],
+        // Distinct byte pattern, verifiable by eye.
+        0x0001020304050607: [0, 1, 2, 3, 4, 5, 6, 7],
+        0x0011223344556677: [0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77],
+        // Realistic multi-GB file sizes (above 2^32).
+        5368709120: [0, 0, 0, 1, 0x40, 0, 0, 0], // 5 GiB
+        107374182400: [0, 0, 0, 0x19, 0, 0, 0, 0], // 100 GiB
+        // Largest exactly-representable int on the web (2^53 - 1).
+        9007199254740991: [0, 0x1F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+      };
+      for (final entry in cases.entries) {
+        final data = ByteData(8);
+        writeUint64BE(data, 0, entry.key);
+        expect(
+          data.buffer.asUint8List(),
+          entry.value,
+          reason: 'value ${entry.key}',
+        );
+      }
+    });
+
+    test('readUint64BE round-trips through writeUint64BE', () {
+      const values = [
+        0,
+        1,
+        255,
+        256,
+        4294967295, // 2^32 - 1
+        4294967296, // 2^32
+        5368709120, // 5 GiB
+        1099511627776, // 1 TiB
+        9007199254740991, // 2^53 - 1
+      ];
+      for (final value in values) {
+        final data = ByteData(8);
+        writeUint64BE(data, 0, value);
+        expect(readUint64BE(data, 0), value);
+      }
+    });
+
+    test('v2 frame round-trips multi-GB sizes', () {
+      final frame = Frame(
+        frameIndex: 1,
+        kind: kFrameKindData,
+        groupIndex: 0,
+        slot: 0,
+        flags: 0,
+        totalGroups: 1,
+        totalDataFrames: 1,
+        originalSize: 1099511627776, // 1 TiB
+        compressedSize: 5368709120, // 5 GiB
+        originalSha256: Uint8List(32),
+        salt: Uint8List(16),
+        nonce: Uint8List(12),
+        payload: Uint8List(10),
+      );
+      final raw = frame.toBytes();
+      // The wire layout is unchanged: originalSize at bytes 20..27,
+      // compressedSize at 28..35, big-endian.
+      expect(raw.sublist(20, 28), [0, 0, 1, 0, 0, 0, 0, 0]);
+      expect(raw.sublist(28, 36), [0, 0, 0, 1, 0x40, 0, 0, 0]);
+      final parsed = Frame.fromBytes(raw);
+      expect(parsed.originalSize, 1099511627776);
+      expect(parsed.compressedSize, 5368709120);
+    });
+
+    test('v1 frame round-trips multi-GB sizes', () {
+      final raw = v1FrameBytes(
+        frameIndex: 1,
+        kind: kFrameKindData,
+        groupIndex: 0,
+        slot: 0,
+        flags: 0,
+        totalGroups: 1,
+        totalDataFrames: 1,
+        originalSize: 1099511627776, // 1 TiB
+        compressedSize: 5368709120, // 5 GiB
+        sha256Bytes: Uint8List(32),
+        payload: Uint8List.fromList([9, 8, 7]),
+      );
+      // v1 offsets: originalSize at bytes 17..24, compressedSize 25..32.
+      expect(raw.sublist(17, 25), [0, 0, 1, 0, 0, 0, 0, 0]);
+      expect(raw.sublist(25, 33), [0, 0, 0, 1, 0x40, 0, 0, 0]);
+      final parsed = Frame.fromBytes(raw);
+      expect(parsed.originalSize, 1099511627776);
+      expect(parsed.compressedSize, 5368709120);
+      expect(parsed.payload, [9, 8, 7]);
     });
   });
 }
