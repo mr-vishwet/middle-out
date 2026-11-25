@@ -9,6 +9,7 @@ import '../core/constants.dart';
 import 'chacha20.dart';
 import 'erasure.dart';
 import 'frame.dart';
+import 'reencode.dart';
 
 /// Statistics for a completed encode.
 class EncodeStats {
@@ -19,6 +20,7 @@ class EncodeStats {
     required this.frameCount,
     required this.groupCount,
     required this.sha256Hex,
+    this.reencode,
   });
 
   /// Bytes of the original file.
@@ -35,6 +37,13 @@ class EncodeStats {
 
   /// SHA-256 hex of the original file.
   final String sha256Hex;
+
+  /// The re-encode record, when the framed bytes are a lossy
+  /// re-encoded copy of the user's file rather than the file itself.
+  /// When set, [originalSize] and [sha256Hex] describe the RE-ENCODED
+  /// bytes (so decode verification still works on them); the true
+  /// original's name, size and SHA live in the record itself.
+  final ReencodeRecord? reencode;
 
   /// Compression ratio (original / compressed).
   double get ratio => originalSize / compressedSize.clamp(1, compressedSize);
@@ -146,11 +155,17 @@ class Encoder {
   /// adaptive [dataPageCount] rule. Tests use small explicit values to
   /// force multi-page shapes cheaply; production callers leave it null.
   /// Streaming encodes keep [maxPayload] as a hard chunk size.
+  ///
+  /// [reencode] records that [data] is itself a lossy re-encoded copy
+  /// of the user's file: it is carried on the stats, and
+  /// [kFlagReencoded] is set on every frame, so a decoder on another
+  /// device still knows the bytes are a re-encoded copy.
   static EncodeResult encode(
     Uint8List data, {
     String? passphrase,
     int? maxPayload,
     bool barcode = false,
+    ReencodeRecord? reencode,
   }) {
     final sha = _hash(data);
     final compressed = _compress(data);
@@ -165,6 +180,7 @@ class Encoder {
       nonce: encrypted.nonce,
       encrypted: passphrase != null,
       barcode: barcode,
+      reencode: reencode,
     );
   }
 
@@ -179,6 +195,7 @@ class Encoder {
     int? maxPayload,
     bool barcode = false,
     EncodeProgress? onProgress,
+    ReencodeRecord? reencode,
   }) async {
     onProgress?.call(0.05, 'Hashing…');
     await Future<void>.delayed(Duration.zero);
@@ -204,6 +221,7 @@ class Encoder {
       nonce: encrypted.nonce,
       encrypted: isEncrypted,
       barcode: barcode,
+      reencode: reencode,
     );
     onProgress?.call(0.95, 'Framing…');
     return result;
@@ -299,6 +317,7 @@ class Encoder {
     required Uint8List nonce,
     required bool encrypted,
     required bool barcode,
+    ReencodeRecord? reencode,
   }) {
     final frames = buildFrames(
       chunks: chunks,
@@ -310,6 +329,7 @@ class Encoder {
       encrypted: encrypted,
       barcode: barcode,
       equalSplit: true,
+      reencoded: reencode != null,
     );
     final totalGroups =
         (chunks.length + kGroupDataFrames - 1) ~/ kGroupDataFrames;
@@ -321,6 +341,7 @@ class Encoder {
         frameCount: frames.length,
         groupCount: totalGroups,
         sha256Hex: sha.map((b) => b.toRadixString(16).padLeft(2, '0')).join(),
+        reencode: reencode,
       ),
       barcode: barcode,
     );
@@ -347,6 +368,11 @@ class Encoder {
   /// equal-sized (last zero-padded) and the decoder derives the chunk
   /// size from the header. Streaming chunks are fixed-size and leave
   /// the flag clear.
+  ///
+  /// [reencoded] sets [kFlagReencoded] on every frame: the framed bytes
+  /// are a lossy re-encoded copy, and the header SHA/size describe
+  /// THOSE bytes — the original's name, size and SHA live only in the
+  /// [ReencodeRecord] carried on the stats, never in a header.
   static List<Frame> buildFrames({
     required List<Uint8List> chunks,
     required Uint8List sha256Bytes,
@@ -357,6 +383,7 @@ class Encoder {
     required bool encrypted,
     required bool barcode,
     bool equalSplit = false,
+    bool reencoded = false,
   }) {
     final dataChunks = chunks.isEmpty ? [Uint8List(0)] : chunks;
     final totalData = dataChunks.length;
@@ -376,6 +403,7 @@ class Encoder {
     if (encrypted) baseFlags |= kFlagEncrypted;
     if (barcode) baseFlags |= kFlagBarcode;
     if (equalSplit) baseFlags |= kFlagEqualSplit;
+    if (reencoded) baseFlags |= kFlagReencoded;
 
     Frame buildFrame({
       required int frameIndex,

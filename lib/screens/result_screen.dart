@@ -83,7 +83,9 @@ class ResultScreen extends StatelessWidget {
                           ),
                           _row(
                             theme,
-                            'SHA-256',
+                            stats.reencode != null
+                                ? 'SHA-256 (re-encoded)'
+                                : 'SHA-256',
                             shortHash(stats.sha256Hex, groups: 4),
                           ),
                           if (controller.streamed)
@@ -110,6 +112,55 @@ class ResultScreen extends StatelessWidget {
                     controller.pdfBandWarning!,
                     style: theme.textTheme.bodyMedium?.copyWith(
                       color: theme.colorScheme.error,
+                    ),
+                  ),
+                ],
+                if (stats.reencode != null) ...[
+                  const SizedBox(height: 16),
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Re-encoded',
+                            style: theme.textTheme.titleMedium,
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Re-encoded to fit 10:1 — the decoded file '
+                            'is a lower-quality copy, not the original.',
+                            style: theme.textTheme.bodyMedium,
+                          ),
+                          const SizedBox(height: 8),
+                          _row(
+                            theme,
+                            'Original',
+                            '${stats.reencode!.originalName} · '
+                            '${formatBytes(stats.reencode!.originalSizeBytes)}',
+                          ),
+                          _row(
+                            theme,
+                            'Re-encoded',
+                            '${formatBytes(stats.reencode!.reencodedSizeBytes)} '
+                            'with ${stats.reencode!.encoder}',
+                          ),
+                          _row(
+                            theme,
+                            'Quality',
+                            stats.reencode!.settingsLabel,
+                          ),
+                          _row(
+                            theme,
+                            'Original SHA-256',
+                            shortHash(
+                              stats.reencode!.originalSha256Hex,
+                              groups: 4,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ],

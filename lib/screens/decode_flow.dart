@@ -67,6 +67,14 @@ class DecodeImportScreen extends StatelessWidget {
                             '${inspection.encrypted ? 'Encrypted' : 'Plain'}',
                             style: theme.textTheme.bodyMedium,
                           ),
+                          if (inspection.isReencoded) ...[
+                            const SizedBox(height: 8),
+                            Text(
+                              'Re-encoded copy — decoding gives back the '
+                              'lower-quality copy, not the original file.',
+                              style: theme.textTheme.bodyMedium,
+                            ),
+                          ],
                           if (inspection.unreadableBlobs > 0) ...[
                             const SizedBox(height: 4),
                             Text(
@@ -385,9 +393,23 @@ class VerifyScreen extends StatelessWidget {
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'Byte-exact. The rebuilt file is the original.',
+                  controller.isReencoded
+                      ? 'Byte-exact against the re-encoded copy in the '
+                          'frame headers — this is a lower-quality copy, '
+                          'not your original file.'
+                      : 'Byte-exact. The rebuilt file is the original.',
                   style: theme.textTheme.bodyLarge,
                 ),
+                if (controller.isReencoded) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    'Re-encoded copy — the decoded file is a lower-quality '
+                    'copy, not your original. Both hashes below are of '
+                    'the re-encoded copy; the original file’s hash is not '
+                    'stored in the frames.',
+                    style: theme.textTheme.bodyMedium,
+                  ),
+                ],
                 const SizedBox(height: 24),
                 TwoPane(
                   first: _HashCard(
@@ -498,7 +520,9 @@ class DecodedScreen extends StatelessWidget {
                     const SizedBox(width: 12),
                     Expanded(
                       child: Text(
-                        'Verified bit-for-bit',
+                        controller.isReencoded
+                            ? 'Verified — re-encoded copy'
+                            : 'Verified bit-for-bit',
                         style: theme.textTheme.titleLarge,
                       ),
                     ),
@@ -522,7 +546,11 @@ class DecodedScreen extends StatelessWidget {
                         ),
                         const SizedBox(height: 4),
                         Text(
-                          'SHA-256 matched the frame headers.',
+                          controller.isReencoded
+                              ? 'SHA-256 matched the frame headers. This '
+                                  'is the lower-quality copy, not your '
+                                  'original file.'
+                              : 'SHA-256 matched the frame headers.',
                           style: theme.textTheme.bodySmall,
                         ),
                       ],

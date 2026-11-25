@@ -28,8 +28,9 @@ const int kFrameVersion = 2;
 ///  8..9    groupIndex       which 8-frame group this frame belongs to (uint16)
 /// 10       slot             0..7 position inside its group (0-5 DATA, 6-7 PARITY)
 /// 11       flags            bit0 = encrypted, bit1 = last group,
-///                           bit2 = barcode, bit3 = equal split
-///                           (bits 4-7 reserved, must be zero)
+///                           bit2 = barcode, bit3 = equal split,
+///                           bit4 = re-encoded (see [kFlagReencoded])
+///                           (bits 5-7 reserved, must be zero)
 /// 12..13   totalGroups      number of 8-frame groups in the encode (uint16)
 /// 14..15   totalDataFrames  number of DATA frames in the encode (uint16)
 /// 16..19   payloadLength    bytes of payload in this frame (uint32)
@@ -87,6 +88,17 @@ const int kFlagBarcode = 0x04;
 /// stream to `compressedSize` before decrypt/decompress. Old frames lack
 /// this flag and keep the fixed-chunk derivation, so old PDFs still decode.
 const int kFlagEqualSplit = 0x08;
+
+/// Set on every frame of an encode whose payload is a RE-ENCODED copy
+/// of the original file (10:1 hard rule): the bytes in the frames are
+/// the re-encoded media, not the original file. The header SHA-256 and
+/// [Frame.originalSize] describe the RE-ENCODED bytes (so decode
+/// verification still works on them); the ORIGINAL file's name, size
+/// and SHA live in the [ReencodeRecord] carried on the encode result,
+/// shown on the cover + result + history, and never presented as the
+/// decoded file's hash. Old decoders ignore this bit (they simply do
+/// not know the file was re-encoded); new decoders label it.
+const int kFlagReencoded = 0x10;
 
 /// Frames per group: up to 6 DATA + up to 2 PARITY. A trailing group
 /// whose second trio is empty emits no second parity frame (an empty

@@ -73,6 +73,14 @@ FLAG_BARCODE = 0x04
 # uses it to derive chunkSize as ceil(compressedSize / totalDataFrames);
 # when it is unset the old derivation applies (old PDFs still decode).
 FLAG_EQUAL_SPLIT = 0x08
+# Set on EVERY frame of a re-encoded file (see lib/codec/reencode.dart
+# kFlagReencoded, 0x10): the framed bytes are a LOSSY re-encoded copy
+# of the original, not the original itself. The header SHA/size
+# describe the RE-ENCODED bytes; the original file's name/size/SHA
+# are only visible on the cover and in the encoding device's history.
+# The decoder only READS this bit (it never changes what it decodes);
+# unflagged frames are unaffected (old-format compatibility).
+FLAG_REENCODED = 0x10
 
 GROUP_DATA_FRAMES = 6
 GROUP_PARITY_FRAMES = 2
@@ -524,6 +532,10 @@ class Frame:
     def is_equal_split(self) -> bool:
         return bool(self.flags & FLAG_EQUAL_SPLIT)
 
+    @property
+    def is_reencoded(self) -> bool:
+        return bool(self.flags & FLAG_REENCODED)
+
     def to_bytes(self) -> bytes:
         header_wo_crc = struct.pack(
             ">4sBHBHBBHHIQQ32s16s12s",
@@ -678,6 +690,7 @@ def encode(
     *,
     max_payload: int | None = None,
     barcode: bool = False,
+    reencoded: bool = False,
 ) -> EncodeResult:
     """Encode [data] into Middle Out frames.
 
@@ -712,6 +725,7 @@ def encode(
         (FLAG_ENCRYPTED if encrypted else 0)
         | (FLAG_BARCODE if barcode else 0)
         | FLAG_EQUAL_SPLIT
+        | (FLAG_REENCODED if reencoded else 0)
     )
     frames: list[Frame] = []
     for group in range(total_groups):

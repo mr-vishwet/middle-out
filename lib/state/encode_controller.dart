@@ -12,6 +12,8 @@ import '../codec/encoder.dart';
 import '../codec/erasure.dart';
 import '../codec/frame.dart';
 import '../codec/pdf_document.dart';
+import '../codec/ratio_engine.dart';
+import '../codec/reencode.dart';
 import '../codec/streaming_encoder.dart';
 import '../core/constants.dart';
 import '../core/format.dart';
@@ -19,6 +21,7 @@ import '../services/file_picker_service.dart';
 import '../services/file_reader.dart';
 import '../services/file_saver.dart' show saveFileBytes;
 import '../services/frame_inspector.dart';
+import '../services/media_reencoder.dart';
 import '../services/pdf_frame_extractor.dart';
 import '../services/pdf_saver.dart' show savePdf;
 import '../services/platform_limits.dart';
@@ -47,6 +50,18 @@ enum EncodePhase {
   error,
 }
 
+/// The user's answer to a re-encode proposal for the current estimate.
+enum ReencodeChoice {
+  /// No answer yet — the proposal is waiting.
+  undecided,
+
+  /// The user confirmed: re-encode, then encode the re-encoded bytes.
+  confirmed,
+
+  /// The user declined: encode the original losslessly instead.
+  declined,
+}
+
 /// A pre-encode estimate, sampled from the head, middle and tail of the
 /// file (or the whole file, when it is small).
 ///
@@ -71,6 +86,12 @@ class EncodeEstimate {
     required this.memoryGuard,
     this.incompressible = false,
     this.overCap = false,
+    this.decision = RatioDecision.lossless,
+    this.losslessPdfBytes,
+    this.reencodeTargetPdfBytes,
+    this.reencodeTargetMediaBytes,
+    this.deadEndReason,
+    this.streaming = false,
   });
 
   /// Estimated compression ratio from the sample.
@@ -105,6 +126,38 @@ class EncodeEstimate {
   /// True when the estimated frame count exceeds [kMaxFrames] — the
   /// estimate screen warns before the user encodes.
   final bool overCap;
+
+  /// The 10:1 verdict for this file ([RatioEngine.analyse]): lossless
+  /// when the projected lossless PDF already fits a tenth of the
+  /// original, reencode when re-encodable media needs a re-encode to
+  /// fit, deadEnd when the file cannot reach 10:1.
+  final RatioDecision decision;
+
+  /// Modeled PDF size for the LOSSLESS encode, in bytes — the same
+  /// number as [estimatedPdfBytes] (kept as its own field so the
+  /// pre-encode screen can show it next to the re-encode target when
+  /// the two differ).
+  final int? losslessPdfBytes;
+
+  /// Modeled PDF size for the proposed re-encode, in bytes — null
+  /// unless [decision] is [RatioDecision.reencode].
+  final int? reencodeTargetPdfBytes;
+
+  /// Largest re-encoded media size that fits the 10:1 target, in
+  /// bytes — null unless [decision] is [RatioDecision.reencode].
+  final int? reencodeTargetMediaBytes;
+
+  /// Plain-language reason the file cannot reach 10:1 — null unless
+  /// [decision] is [RatioDecision.deadEnd]. Shown verbatim on the
+  /// pre-encode screen.
+  final String? deadEndReason;
+
+  /// True when this estimate prices the streaming path (large native
+  /// file, fixed 64 KiB chunks). A streaming file cannot be
+  /// re-encoded — the re-encoder needs the whole file in memory — so
+  /// the proposal is shown with that note and only the lossless path
+  /// is offered.
+  final bool streaming;
 }
 
 /// How much memory an encode is expected to need.
@@ -148,13 +201,25 @@ class MemoryGuard {
 /// Large native files (at or above [streamingThresholdBytes]) encode
 /// through [StreamingEncoder] so the file is never loaded whole; smaller
 /// files and web files use the in-memory path.
+///
+/// The 10:1 rule lives here too: when the estimate says a re-encodable
+/// file needs a re-encode ([RatioDecision.reencode]), the pre-encode
+/// screen proposes it and nothing re-encodes until the user confirms
+/// ([confirmReencode]); [declineReencode] encodes the original
+/// losslessly instead. When the estimate is a dead end, the screen
+/// offers "Encode losslessly anyway" ([acknowledgeDeadEnd]) or Cancel.
 class EncodeController extends ChangeNotifier {
   /// Creates an encode controller with the platform-default mode.
-  EncodeController({FilePickerService? picker})
+  EncodeController({FilePickerService? picker, MediaReencoder? reencoder})
       : _picker = picker ?? FilePickerService(),
+        _reencoder = reencoder ?? createMediaReencoder(),
         mode = PlatformLimitsService.defaultMode();
 
   final FilePickerService _picker;
+
+  /// The platform media re-encoder (stub unless Worker C's real
+  /// encoder is in place; tests inject a fake).
+  final MediaReencoder _reencoder;
 
   /// Files at or above this size use the streaming encoder on native.
   static const int streamingThresholdBytes = 32 * 1024 * 1024;
@@ -296,6 +361,11 @@ class EncodeController extends ChangeNotifier {
   /// instead of accumulating in memory (false: the writer is eager
   /// but still returns the whole PDF as bytes, so one full copy is
   /// held; the sink does not exist yet).
+  ///
+  /// [mediaKind] and [losslessOnly] feed the 10:1 verdict
+  /// ([RatioEngine.analyse]): the estimate carries the decision plus
+  /// both PDF sizes when they differ (lossless vs re-encode target)
+  /// and the dead-end reason when the file cannot reach 10:1.
   static EncodeEstimate estimateFor({
     required int fileSize,
     required double ratio,
@@ -307,6 +377,8 @@ class EncodeController extends ChangeNotifier {
     bool web = false,
     bool mobile = false,
     bool streamingBinding = false,
+    MediaKind mediaKind = MediaKind.other,
+    bool losslessOnly = false,
   }) {
     final clampedRatio = ratio.clamp(1.0, 1000.0);
     final estCompressed = (fileSize / clampedRatio).ceil();
@@ -344,6 +416,16 @@ class EncodeController extends ChangeNotifier {
       mobile: mobile,
       streamingBinding: streamingBinding,
     );
+    final plan = RatioEngine.analyse(
+      fileSize: fileSize,
+      sampledRatio: clampedRatio,
+      kind: mediaKind,
+      losslessOnly: losslessOnly,
+      barcode: barcode,
+      encrypted: encrypted,
+      secondPassFactor: secondPassFactor,
+      streaming: streaming,
+    );
     return EncodeEstimate(
       ratio: clampedRatio,
       estimatedFrames: frames,
@@ -356,6 +438,12 @@ class EncodeController extends ChangeNotifier {
       memoryGuard: memoryGuard,
       incompressible: clampedRatio < incompressibleRatioThreshold,
       overCap: frames > kMaxFrames,
+      decision: plan.decision,
+      losslessPdfBytes: estimatedPdfBytes,
+      reencodeTargetPdfBytes: plan.reencodeTargetPdfBytes,
+      reencodeTargetMediaBytes: plan.reencodeTargetMediaBytes,
+      deadEndReason: plan.deadEndReason,
+      streaming: streaming,
     );
   }
 
@@ -516,6 +604,42 @@ class EncodeController extends ChangeNotifier {
   /// Pre-encode estimate, refreshed when a file is picked.
   EncodeEstimate? estimate;
 
+  /// Lossless-only mode (from settings): when on, no re-encode is
+  /// ever proposed; the estimate shows the true lossless size.
+  bool losslessOnly = false;
+
+  /// The user's answer to the re-encode proposal for the current
+  /// estimate. Reset whenever the estimate is recomputed.
+  ReencodeChoice reencodeChoice = ReencodeChoice.undecided;
+
+  /// True once the user has chosen "Encode losslessly anyway" for the
+  /// current dead-end estimate. Reset whenever the estimate is
+  /// recomputed, so a new file or toggle change asks again.
+  bool deadEndAcknowledged = false;
+
+  /// The re-encoder's plan for the current proposal (its encoder +
+  /// quality settings), when it can describe them up front. Null
+  /// when the re-encoder cannot plan ahead (the stub, or a plan that
+  /// failed to load) — the proposal then shows a generic line, and
+  /// the real settings are reported by the re-encode itself.
+  ReencodePlan? reencodePlan;
+
+  /// Which file [reencodePlan] was loaded for (name:size), so a plan
+  /// is loaded once per file and never re-read on toggle changes.
+  String? _planKey;
+
+  /// True when the current estimate proposes a re-encode and the user
+  /// has not answered yet.
+  bool get awaitingReencodeDecision =>
+      estimate?.decision == RatioDecision.reencode &&
+      reencodeChoice == ReencodeChoice.undecided;
+
+  /// True when the current estimate is a dead end and the user has
+  /// not chosen "Encode losslessly anyway" yet.
+  bool get awaitingDeadEndDecision =>
+      estimate?.decision == RatioDecision.deadEnd &&
+      !deadEndAcknowledged;
+
   /// True once the user has acknowledged a memory-guard warning for
   /// the current estimate (two-tap encode: the first tap on Encode
   /// acknowledges, the second starts the encode). Reset whenever the
@@ -526,6 +650,36 @@ class EncodeController extends ChangeNotifier {
   /// current estimate, so the next Encode tap starts the encode.
   void acknowledgeMemoryWarning() {
     memoryWarningAcknowledged = true;
+    notifyListeners();
+  }
+
+  /// Confirms the re-encode proposal: records the choice, then starts
+  /// the re-encode followed by the normal encode. The caller navigates
+  /// to the progress screen right after calling this (without
+  /// awaiting it) — the encode runs while the screen shows progress.
+  /// No-op when the current estimate does not propose a re-encode.
+  Future<void> confirmReencode() async {
+    if (estimate?.decision != RatioDecision.reencode) return;
+    reencodeChoice = ReencodeChoice.confirmed;
+    notifyListeners();
+    await encode();
+  }
+
+  /// Declines the re-encode proposal: records the choice, then encodes
+  /// the original losslessly. The caller navigates to the progress
+  /// screen right after calling this (without awaiting it).
+  /// No-op when the current estimate does not propose a re-encode.
+  Future<void> declineReencode() async {
+    if (estimate?.decision != RatioDecision.reencode) return;
+    reencodeChoice = ReencodeChoice.declined;
+    notifyListeners();
+    await encode();
+  }
+
+  /// Records "Encode losslessly anyway" for a dead-end estimate, so
+  /// the normal Encode button proceeds with a lossless encode.
+  void acknowledgeDeadEnd() {
+    deadEndAcknowledged = true;
     notifyListeners();
   }
 
@@ -566,11 +720,17 @@ class EncodeController extends ChangeNotifier {
           pdfStats!.sizeBytes,
         );
 
-  /// Applies the user's default toggles (called once at app start).
+  /// Applies the user's default toggles (called once at app start,
+  /// and again when the user changes them in Settings). When a file
+  /// is already picked, the estimate is recomputed — the lossless-only
+  /// toggle changes the 10:1 verdict, so a stale estimate would show
+  /// the wrong proposal.
   void applySettings(SettingsController settings) {
     barcode = settings.defaultBarcode;
     encrypted = settings.defaultEncrypted;
+    losslessOnly = settings.losslessOnly;
     notifyListeners();
+    if (file != null) unawaitedRefreshEstimate();
   }
 
   /// Sets the encode mode, re-checking the picked file against it.
@@ -651,6 +811,10 @@ class EncodeController extends ChangeNotifier {
         pdfStats = null;
         savedPath = null;
         streamed = false;
+        reencodeChoice = ReencodeChoice.undecided;
+        deadEndAcknowledged = false;
+        reencodePlan = null;
+        _planKey = null;
         phase = EncodePhase.ready;
         await refreshEstimate();
       }
@@ -691,6 +855,8 @@ class EncodeController extends ChangeNotifier {
       return;
     }
     memoryWarningAcknowledged = false;
+    reencodeChoice = ReencodeChoice.undecided;
+    deadEndAcknowledged = false;
     try {
       final samples = await _picker.readRefSamples(
         current,
@@ -726,6 +892,12 @@ class EncodeController extends ChangeNotifier {
       final willStream = !kIsWeb &&
           current.hasPath &&
           current.size >= streamingThresholdBytes;
+      // Media kind from the file name, with the head sample's magic
+      // bytes as fallback when the extension is missing or lying.
+      final kind = detectMediaKind(
+        current.name,
+        samples.isNotEmpty ? samples.first : null,
+      );
       estimate = estimateFor(
         fileSize: current.size,
         ratio: ratio,
@@ -737,12 +909,90 @@ class EncodeController extends ChangeNotifier {
         web: kIsWeb,
         mobile: defaultTargetPlatform == TargetPlatform.iOS ||
             defaultTargetPlatform == TargetPlatform.android,
+        mediaKind: kind,
+        losslessOnly: losslessOnly,
       );
+      // Load the re-encoder's plan for a re-encode proposal, once per
+      // file: the proposal shows the quality settings the user is
+      // confirming. Only for in-memory files (a streaming file cannot
+      // be re-encoded) and only when the platform can re-encode at
+      // all. A plan that fails to load leaves [reencodePlan] null —
+      // the proposal shows a generic line instead of blocking.
+      if (estimate!.decision == RatioDecision.reencode &&
+          _reencoder.isAvailable &&
+          !willStream) {
+        final key = '${current.name}:${current.size}';
+        if (_planKey != key) {
+          _planKey = key;
+          reencodePlan = null;
+          try {
+            final bytes = await _picker.readRef(current);
+            reencodePlan = await _reencoder.plan(
+              bytes,
+              current.name,
+              targetBytes: estimate!.reencodeTargetMediaBytes!,
+            );
+          } catch (_) {
+            reencodePlan = null;
+          }
+        }
+      } else {
+        reencodePlan = null;
+        _planKey = null;
+      }
     } catch (_) {
       estimate = null;
     }
     notifyListeners();
   }
+
+  /// Runs one confirmed re-encode through the platform re-encoder.
+  /// Returns null (after failing honestly) when the file is not
+  /// re-encodable, the output overshoots its budget, or the encoder
+  /// reports it cannot fit even at the quality floor. Never returns
+  /// the input unchanged: an over-budget result fails instead of
+  /// shipping a PDF over 10:1.
+  Future<ReencodedMedia?> _runReencode(
+    Uint8List bytes,
+    String name,
+    int targetBytes,
+  ) async {
+    try {
+      final reencoded = await _reencoder.reencode(
+        bytes,
+        name,
+        targetBytes: targetBytes,
+        onProgress: (fraction, label) {
+          progress = fraction * 0.2;
+          progressLabel = label;
+          notifyListeners();
+        },
+      );
+      if (reencoded == null) {
+        _fail('This file cannot be re-encoded on this device — its '
+            'format is not supported by the encoder.');
+        return null;
+      }
+      if (reencoded.bytes.length > targetBytes) {
+        _fail('The re-encoder returned '
+            '${formatBytes(reencoded.bytes.length)}, over the '
+            '${formatBytes(targetBytes)} budget — stopping rather than '
+            'shipping a PDF over 10:1.');
+        return null;
+      }
+      return reencoded;
+    } on ReencodeException catch (e) {
+      _fail(e.message);
+      return null;
+    }
+  }
+
+  /// SHA-256 hex of [bytes].
+  static String _sha256Hex(Uint8List bytes) => sha256
+      .convert(bytes)
+      .bytes
+      .map((b) => b.toRadixString(16).padLeft(2, '0'))
+      .join();
 
   /// Records a failed encode. The progress bar resets to 0 and the label
   /// reads 'Failed' so an error never sits next to a stale mid-encode
@@ -756,11 +1006,31 @@ class EncodeController extends ChangeNotifier {
   }
 
   /// Runs the encode, then builds the PDF and records history.
+  ///
+  /// Guards: a re-encode proposal that the user has not confirmed
+  /// never starts a re-encode ([confirmReencode] is the only path
+  /// in), and a dead-end estimate never encodes until the user has
+  /// chosen "Encode losslessly anyway". Both fail honestly with the
+  /// reason instead of silently picking a path.
   Future<void> encode() async {
     final current = file;
     if (current == null || phase == EncodePhase.encoding) return;
     if (encrypted && passphrase.isEmpty) {
       _fail('Encryption is on — set a passphrase, or turn it off.');
+      notifyListeners();
+      return;
+    }
+    if (awaitingReencodeDecision) {
+      _fail('This file needs a re-encode to reach 10:1 — confirm the '
+          'proposal on the pre-encode screen, or encode it losslessly '
+          'instead.');
+      notifyListeners();
+      return;
+    }
+    if (awaitingDeadEndDecision) {
+      _fail("This file can't reach 10:1 — ${estimate!.deadEndReason} "
+          'Encode it losslessly anyway from the pre-encode screen, or '
+          'pick another file.');
       notifyListeners();
       return;
     }
@@ -776,7 +1046,18 @@ class EncodeController extends ChangeNotifier {
           StreamingEncoder.isSupported &&
           current.hasPath &&
           current.size >= streamingThresholdBytes;
+      if (useStreaming && reencodeChoice == ReencodeChoice.confirmed) {
+        // A re-encode needs the whole file in memory; a streaming
+        // file never loads whole. Fail honestly instead of silently
+        // falling back to a lossless encode the user did not pick.
+        _fail('Re-encoding needs the whole file in memory — this file '
+            'is too large to re-encode on this device. Go back and '
+            'encode it losslessly instead.');
+        notifyListeners();
+        return;
+      }
       final EncodeResult encoded;
+      ReencodeRecord? reencodeRecord;
       if (useStreaming) {
         streamed = true;
         encoded = await StreamingEncoder.encodeFile(
@@ -792,12 +1073,51 @@ class EncodeController extends ChangeNotifier {
       } else {
         streamed = false;
         final bytes = await _picker.readRef(current);
+        var inputBytes = bytes;
+        if (estimate?.decision == RatioDecision.reencode &&
+            reencodeChoice == ReencodeChoice.confirmed) {
+          // Confirmed re-encode: shrink the media to the ratio
+          // engine's budget first, then encode THOSE bytes. The
+          // record carries the original's identity; the frames carry
+          // the re-encoded bytes' hash and size.
+          final targetMedia = estimate!.reencodeTargetMediaBytes!;
+          progress = 0.02;
+          progressLabel = 'Re-encoding…';
+          notifyListeners();
+          final reencoded = await _runReencode(
+            bytes,
+            current.name,
+            targetMedia,
+          );
+          if (reencoded == null) {
+            // [_runReencode] already failed honestly.
+            notifyListeners();
+            return;
+          }
+          reencodeRecord = ReencodeRecord(
+            originalName: current.name,
+            originalSizeBytes: bytes.length,
+            originalSha256Hex: _sha256Hex(bytes),
+            mediaKind: detectMediaKind(current.name, bytes),
+            encoder: reencoded.encoder,
+            settingsLabel: reencoded.settingsLabel,
+            reencodedSizeBytes: reencoded.bytes.length,
+            reencodedSha256Hex: _sha256Hex(reencoded.bytes),
+            targetPdfBytes: estimate!.reencodeTargetPdfBytes!,
+          );
+          inputBytes = reencoded.bytes;
+        }
+        // Re-encode stage takes 0..0.2 of the bar; the normal encode
+        // takes 0.2..0.8 (or 0..0.8 when there was no re-encode).
+        final encodeBase = reencodeRecord != null ? 0.2 : 0.0;
+        final encodeSpan = reencodeRecord != null ? 0.6 : 0.8;
         encoded = await Encoder.encodeAsync(
-          bytes,
+          inputBytes,
           passphrase: encrypted ? passphrase : null,
           barcode: barcode,
+          reencode: reencodeRecord,
           onProgress: (fraction, label) {
-            progress = fraction * 0.8;
+            progress = encodeBase + fraction * encodeSpan;
             progressLabel = label;
             notifyListeners();
           },
@@ -828,18 +1148,24 @@ class EncodeController extends ChangeNotifier {
       progress = 1;
       progressLabel = 'Done';
       phase = EncodePhase.done;
+      // For a re-encoded encode, the history record describes the
+      // user's ORIGINAL file (name, size, SHA) and carries the record;
+      // the stats' size/SHA describe the re-encoded bytes.
       final record = HistoryRecord(
         id: HistoryRecord.newId(),
         kind: HistoryKind.encode,
         fileName: current.name,
-        originalBytes: encoded.stats.originalSize,
+        originalBytes:
+            reencodeRecord?.originalSizeBytes ?? encoded.stats.originalSize,
         encodedBytes: encoded.stats.compressedSize,
         frameCount: encoded.stats.frameCount,
         groupCount: encoded.stats.groupCount,
         barcode: barcode,
         encrypted: encrypted,
-        sha256Hex: encoded.stats.sha256Hex,
+        sha256Hex:
+            reencodeRecord?.originalSha256Hex ?? encoded.stats.sha256Hex,
         createdAt: DateTime.now(),
+        reencode: reencodeRecord,
       );
       await onEncoded?.call(record);
     } on BuildCancelledException {
@@ -891,6 +1217,10 @@ class EncodeController extends ChangeNotifier {
     progressLabel = '';
     estimate = null;
     memoryWarningAcknowledged = false;
+    reencodeChoice = ReencodeChoice.undecided;
+    deadEndAcknowledged = false;
+    reencodePlan = null;
+    _planKey = null;
     streamed = false;
     result = null;
     pdfBytes = null;
@@ -965,6 +1295,12 @@ class DecodeController extends ChangeNotifier {
 
   /// Last error message, if any.
   String? error;
+
+  /// True when the imported frames are a re-encoded copy: decoding
+  /// gives back the lower-quality copy, not the user's original file.
+  /// The header SHA verifies the re-encoded bytes; the original's
+  /// hash is not in the frames.
+  bool get isReencoded => inspection?.isReencoded ?? false;
 
   /// Called with the history record after a verified decode.
   Future<void> Function(HistoryRecord record)? onDecoded;

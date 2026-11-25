@@ -24,6 +24,13 @@ class SettingsController extends ChangeNotifier {
   /// Show the seeded demo records and demo card.
   bool showDemo = true;
 
+  /// Lossless-only mode: when on, no re-encode is ever proposed — a
+  /// file that cannot reach 10:1 losslessly is a dead end, and the
+  /// estimate shows the true lossless size with the incompressible
+  /// warning. Default off: re-encodable media may be proposed for
+  /// re-encoding, always with the user's confirmation.
+  bool losslessOnly = false;
+
   /// True once [load] has completed.
   bool loaded = false;
 
@@ -37,6 +44,7 @@ class SettingsController extends ChangeNotifier {
       autoVerify = json['autoVerify'] as bool? ?? true;
       keepPdfs = json['keepPdfs'] as bool? ?? true;
       showDemo = json['showDemo'] as bool? ?? true;
+      losslessOnly = json['losslessOnly'] as bool? ?? false;
     }
     loaded = true;
     notifyListeners();
@@ -77,6 +85,13 @@ class SettingsController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Sets lossless-only mode (no re-encode is ever proposed).
+  Future<void> setLosslessOnly(bool value) async {
+    losslessOnly = value;
+    await _persist();
+    notifyListeners();
+  }
+
   /// Serialises settings to JSON.
   Map<String, dynamic> toJson() => {
         'defaultBarcode': defaultBarcode,
@@ -84,6 +99,7 @@ class SettingsController extends ChangeNotifier {
         'autoVerify': autoVerify,
         'keepPdfs': keepPdfs,
         'showDemo': showDemo,
+        'losslessOnly': losslessOnly,
       };
 
   Future<void> _persist() async {

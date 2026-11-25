@@ -127,7 +127,8 @@ class _HistoryScreenState extends State<HistoryScreen> {
                       '${formatBytes(record.encodedBytes)} '
                       '(${formatRatio(record.ratio)}) · '
                       '${record.frameCount} frames · '
-                      '${_dateLabel(record.createdAt)}',
+                      '${_dateLabel(record.createdAt)}'
+                      '${record.reencode != null ? ' · Re-encoded' : ''}',
                     ),
                     trailing: const Icon(Icons.chevron_right),
                     onTap: () => Navigator.of(context).pushNamed(
@@ -238,9 +239,28 @@ class HistoryDetailScreen extends StatelessWidget {
                         ),
                         _row(
                           theme,
-                          'SHA-256',
+                          record.reencode != null
+                              ? 'Original SHA-256'
+                              : 'SHA-256',
                           shortHash(record.sha256Hex, groups: 4),
                         ),
+                        if (record.reencode != null) ...[
+                          _row(
+                            theme,
+                            'Re-encoded',
+                            '${formatBytes(record.reencode!.reencodedSizeBytes)} '
+                            'with ${record.reencode!.encoder} '
+                            '(${record.reencode!.settingsLabel})',
+                          ),
+                          _row(
+                            theme,
+                            'Re-encoded SHA-256',
+                            shortHash(
+                              record.reencode!.reencodedSha256Hex,
+                              groups: 4,
+                            ),
+                          ),
+                        ],
                         _row(
                           theme,
                           'Date',
@@ -268,6 +288,14 @@ class HistoryDetailScreen extends StatelessWidget {
                     'Seeded example from the design — not a measurement. '
                     'Hide demo records from Settings.',
                     style: theme.textTheme.bodySmall,
+                  ),
+                ],
+                if (record.reencode != null) ...[
+                  const SizedBox(height: 16),
+                  Text(
+                    'Re-encoded to fit 10:1 — decoding this PDF gives '
+                    'back the lower-quality copy, not the original file.',
+                    style: theme.textTheme.bodyMedium,
                   ),
                 ],
                 const SizedBox(height: 24),

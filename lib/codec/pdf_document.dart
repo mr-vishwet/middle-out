@@ -176,6 +176,12 @@ class PdfDocument {
   /// theme, page count — nothing else. No SHA-256, payload size, ratio
   /// or frame counts: those live in the frame headers, not on the cover.
   /// Long file names are truncated so the line cannot run into the QR.
+  ///
+  /// A re-encoded encode adds two plain lines: the decoded file is a
+  /// lower-quality copy, not the original, and what it was re-encoded
+  /// from/with. The cover is the one place (with history) where the
+  /// original's size survives — the frame headers carry only the
+  /// re-encoded bytes' size and SHA.
   static List<String> _detailLines(
     EncodeResult result,
     String fileName,
@@ -186,13 +192,33 @@ class PdfDocument {
         ? '${fileName.substring(0, maxName - 3)}...'
         : fileName;
     final stats = result.stats;
-    return [
+    final lines = [
       'File: $name',
       'Original size: ${formatBytes(stats.originalSize)}',
       'Format: ${result.barcode ? 'Barcode' : 'QR-style grid'}',
       'Theme: ${dark ? 'Dark' : 'Light'}',
       'Pages: ${1 + result.frames.length}',
     ];
+    final reencode = stats.reencode;
+    if (reencode != null) {
+      // The 'Original size' line above is the RE-ENCODED size (the
+      // frames' originalSize): say so plainly, with the true original.
+      lines[1] =
+          'Original size: ${formatBytes(stats.originalSize)} (re-encoded)';
+      const maxSettings = 40;
+      final settings = reencode.settingsLabel.length > maxSettings
+          ? '${reencode.settingsLabel.substring(0, maxSettings - 3)}...'
+          : reencode.settingsLabel;
+      lines.add(
+        'Re-encoded to fit 10:1 — decoded file is a lower-quality '
+        'copy, not the original',
+      );
+      lines.add(
+        'Re-encoded from ${formatBytes(reencode.originalSizeBytes)} '
+        'with ${reencode.encoder} ($settings)',
+      );
+    }
+    return lines;
   }
 
   /// The cover QR as (width, height, deflate), with a quiet zone of

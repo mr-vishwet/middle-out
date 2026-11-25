@@ -1,6 +1,10 @@
+import 'dart:async' show unawaited;
+
 import 'package:material_ui/material_ui.dart';
 
 import '../codec/code_grid.dart';
+import '../codec/ratio_engine.dart';
+import '../codec/reencode.dart';
 import '../core/adaptive.dart';
 import '../core/format.dart';
 import '../core/routes.dart';
@@ -311,13 +315,84 @@ class PreEncodeScreen extends StatelessWidget {
                   ),
                 ],
                 const SizedBox(height: 24),
-                _EncodeButton(controller: controller),
+                _PreEncodeActions(controller: controller),
               ],
             ),
           );
         },
       ),
     );
+  }
+}
+
+/// The action buttons on the pre-encode screen: the re-encode proposal
+/// (confirm / encode losslessly instead) when the estimate proposes a
+/// re-encode, the dead-end choice (encode losslessly anyway / cancel)
+/// when the file cannot reach 10:1, and the normal Encode button
+/// otherwise (including after the user has answered either question).
+class _PreEncodeActions extends StatelessWidget {
+  /// Creates the pre-encode actions.
+  const _PreEncodeActions({required this.controller});
+
+  /// Encode controller.
+  final EncodeController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    if (controller.awaitingReencodeDecision) {
+      // A streaming file cannot be re-encoded (the re-encoder needs
+      // the whole file in memory), so only the lossless path is
+      // offered — the proposal card above says so.
+      if (controller.estimate!.streaming) {
+        return FilledButton(
+          onPressed: () {
+            unawaited(controller.declineReencode());
+            Navigator.of(context).pushNamed(AppRoutes.encodeProgress);
+          },
+          child: const Text('Encode losslessly instead'),
+        );
+      }
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          FilledButton(
+            onPressed: () {
+              unawaited(controller.confirmReencode());
+              Navigator.of(context).pushNamed(AppRoutes.encodeProgress);
+            },
+            child: const Text('Re-encode to fit 10:1'),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton(
+            onPressed: () {
+              unawaited(controller.declineReencode());
+              Navigator.of(context).pushNamed(AppRoutes.encodeProgress);
+            },
+            child: const Text('Encode losslessly instead'),
+          ),
+        ],
+      );
+    }
+    if (controller.awaitingDeadEndDecision) {
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          FilledButton(
+            onPressed: () {
+              controller.acknowledgeDeadEnd();
+              Navigator.of(context).pushNamed(AppRoutes.encodeProgress);
+            },
+            child: const Text('Encode losslessly anyway'),
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+        ],
+      );
+    }
+    return _EncodeButton(controller: controller);
   }
 }
 
@@ -387,6 +462,12 @@ class _EstimateRows extends StatelessWidget {
           'PDF size',
           'about ${formatBytes(estimate.estimatedPdfBytes)}',
         ),
+        if (estimate.reencodeTargetPdfBytes != null)
+          _row(
+            theme,
+            'Re-encoded PDF',
+            'about ${formatBytes(estimate.reencodeTargetPdfBytes!)}',
+          ),
         _row(
           theme,
           'Time',
@@ -409,11 +490,68 @@ class _EstimateRows extends StatelessWidget {
                   'extrapolated — real ratios depend on the file.',
           style: theme.textTheme.bodySmall,
         ),
-        if (estimate.incompressible) ...[
+        if (estimate.incompressible &&
+            estimate.decision != RatioDecision.reencode) ...[
           const SizedBox(height: 12),
           Text(
             "This file is already compressed, so the PDF will be about "
             "the same size as the file — it can't get smaller.",
+            style: theme.textTheme.bodyMedium,
+          ),
+        ],
+        if (estimate.decision == RatioDecision.reencode) ...[
+          const SizedBox(height: 12),
+          Text(
+            'Re-encode to fit 10:1',
+            style: theme.textTheme.titleMedium,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Lossless, this file would be about '
+            '${formatBytes(estimate.losslessPdfBytes ?? estimate.estimatedPdfBytes)} '
+            '— over a tenth of '
+            '${formatBytes(controller.file!.size)}. Re-encoded to about '
+            '${formatBytes(estimate.reencodeTargetMediaBytes ?? 0)}, the '
+            'PDF is about '
+            '${formatBytes(estimate.reencodeTargetPdfBytes ?? 0)}.',
+            style: theme.textTheme.bodyMedium,
+          ),
+          const SizedBox(height: 4),
+          if (controller.reencodePlan != null)
+            Text(
+              'Quality: ${controller.reencodePlan!.settingsLabel} '
+              '(${controller.reencodePlan!.encoder})',
+              style: theme.textTheme.bodyMedium,
+            )
+          else
+            Text(
+              'Quality is chosen by the encoder to fit the target — '
+              'the lowest quality that fits, never below the quality '
+              'floor (video ${ReencodeQualityFloor.minVideoWidth}×'
+              '${ReencodeQualityFloor.minVideoHeight} @ '
+              '${ReencodeQualityFloor.minVideoBitrate ~/ 1000} kbps, '
+              'images JPEG ${ReencodeQualityFloor.minJpegQuality}).',
+              style: theme.textTheme.bodySmall,
+            ),
+          const SizedBox(height: 4),
+          Text(
+            'The decoded file will be a lower-quality copy, not the '
+            'original. Nothing re-encodes until you confirm it below.',
+            style: theme.textTheme.bodyMedium,
+          ),
+          if (estimate.streaming) ...[
+            const SizedBox(height: 4),
+            Text(
+              'This file encodes by streaming off disk, so re-encoding '
+              'is not available for it — encode it losslessly instead.',
+              style: theme.textTheme.bodyMedium,
+            ),
+          ],
+        ],
+        if (estimate.decision == RatioDecision.deadEnd) ...[
+          const SizedBox(height: 12),
+          Text(
+            "This file can't reach 10:1 — ${estimate.deadEndReason ?? ''}",
             style: theme.textTheme.bodyMedium,
           ),
         ],

@@ -169,6 +169,11 @@ class Frame {
   /// True when the frame is rendered as a barcode ([kFlagBarcode]).
   bool get isBarcode => flags & kFlagBarcode != 0;
 
+  /// True when the framed bytes are a lossy re-encoded copy
+  /// ([kFlagReencoded]): the header SHA/size describe the RE-ENCODED
+  /// bytes, not the user's original file.
+  bool get isReencoded => flags & kFlagReencoded != 0;
+
   /// True when this frame is in the last group ([kFlagLastGroup]).
   bool get isLastGroup => flags & kFlagLastGroup != 0;
 

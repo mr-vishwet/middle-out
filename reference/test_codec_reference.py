@@ -168,6 +168,39 @@ class RoundTripTests(unittest.TestCase):
         self.assertEqual(frame.total_data_frames, 1)
         self.assertEqual(len(frame.to_bytes()), mo.HEADER_SIZE + len(frame.payload) + 4)
 
+    def test_reencoded_flag_parses_and_decodes_identically(self):
+        # FLAG_REENCODED (0x10) marks a lossy re-encoded copy: the
+        # flag must survive a serialise/parse round-trip, the payload
+        # must decode byte-identically, and unflagged frames must be
+        # unaffected (old-format compatibility).
+        self.assertEqual(mo.FLAG_REENCODED, 0x10)
+        data = _sample_text()
+        flagged = mo.encode(data, reencoded=True)
+        plain = mo.encode(data)
+        self.assertEqual(len(flagged.frames), len(plain.frames))
+        for f_flag, f_plain in zip(flagged.frames, plain.frames):
+            self.assertTrue(f_flag.is_reencoded)
+            self.assertTrue(f_flag.flags & mo.FLAG_REENCODED)
+            self.assertFalse(f_plain.is_reencoded)
+            self.assertEqual(f_flag.flags & ~mo.FLAG_REENCODED,
+                             f_plain.flags)
+            self.assertEqual(f_flag.payload, f_plain.payload)
+            raw = f_flag.to_bytes()
+            parsed = mo.Frame.from_bytes(raw)
+            self.assertTrue(parsed.is_reencoded)
+            self.assertEqual(parsed.flags, f_flag.flags)
+        self.assertEqual(
+            mo.decode([f.to_bytes() for f in flagged.frames]), data)
+        self.assertEqual(
+            mo.decode([f.to_bytes() for f in plain.frames]), data)
+        # The flag composes with the other flags (encrypted + barcode).
+        enc = mo.encode(data, passphrase='pw', barcode=True, reencoded=True)
+        self.assertTrue(all(f.is_reencoded for f in enc.frames))
+        self.assertTrue(all(f.is_encrypted for f in enc.frames))
+        self.assertTrue(all(f.is_barcode for f in enc.frames))
+        self.assertEqual(
+            mo.decode([f.to_bytes() for f in enc.frames], 'pw'), data)
+
     def test_v2_header_roundtrips_indices_above_255(self):
         frame = mo.Frame(
             frame_index=300,
@@ -1222,18 +1255,28 @@ class PdfTests(unittest.TestCase):
     def test_pdf_dart_samples_decode(self):
         # Cross-check: the Dart-built samples in docs/samples/ decode
         # through the Python extractor + decoder to the demo file
-        # (the CURRENT repo README repeated 461 times — see
-        # docs/samples/README.md; passphrase published there on
-        # purpose). The expected bytes are computed from the README
-        # at test time so the check tracks README edits instead of
-        # pinning a stale demo: the old 1,048,576-byte demo
-        # (SHA e78a38dc…) predates the current README and is gone.
-        readme_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..", "README.md",
+        # documented in docs/samples/README.md (1,023,420 bytes,
+        # SHA-256 158094c2... — the repo README as it was when the
+        # samples were built, repeated 461 times; passphrase published
+        # there on purpose). The expected size + SHA are read from
+        # that README, NOT recomputed from the live repo README:
+        # README edits must not break this test (a 2026-11-25 README
+        # rewrite grew it 2,220 -> 3,030 bytes and broke the old
+        # compute-from-README version). When the samples are rebuilt,
+        # docs/samples/README.md is updated with them and this test
+        # tracks it.
+        samples_readme = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "docs", "samples", "README.md",
         )
-        with open(readme_path, "rb") as fh:
-            demo = fh.read() * 461
-        demo_sha = hashlib.sha256(demo).hexdigest()
+        with open(samples_readme, "r", encoding="utf-8") as fh:
+            doc = fh.read()
+        size_match = re.search(r"exactly ([\d,]+) bytes", doc)
+        sha_match = re.search(r"SHA-256 `([0-9a-f]{64})`", doc)
+        self.assertIsNotNone(size_match, "samples README states demo size")
+        self.assertIsNotNone(sha_match, "samples README states demo SHA")
+        demo_size = int(size_match.group(1).replace(",", ""))
+        demo_sha = sha_match.group(1)
         for name in ("middle-out-sample-light.pdf", "middle-out-sample-dark.pdf"):
             fixture = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
@@ -1243,7 +1286,7 @@ class PdfTests(unittest.TestCase):
                 if not os.path.exists(fixture):
                     self.skipTest("Dart sample not present")
                 data = mo.decode_pdf(fixture, "middle-out-sample-2026")
-                self.assertEqual(len(data), len(demo))
+                self.assertEqual(len(data), demo_size)
                 self.assertEqual(hashlib.sha256(data).hexdigest(), demo_sha)
 
     def test_pdf_old_format_grid_still_decodes(self):

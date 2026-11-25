@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 
+import '../codec/reencode.dart';
 import '../services/storage_service.dart';
 
 /// Whether a history record is an encode or a decode.
@@ -34,6 +35,7 @@ class HistoryRecord {
     this.decodeCount = 0,
     this.savedPath,
     this.migrated = false,
+    this.reencode,
   });
 
   /// Stable id (milliseconds + random suffix at creation time).
@@ -81,6 +83,14 @@ class HistoryRecord {
   /// True once the record has been migrated into the account.
   final bool migrated;
 
+  /// The re-encode record, when this encode framed a lossy re-encoded
+  /// copy instead of the file itself. When set, [sha256Hex] is the
+  /// ORIGINAL file's hash (the file this copy was made from) and
+  /// [originalBytes] is the original file's size; the re-encoded
+  /// copy's size and hash live in the record. Null for lossless
+  /// encodes and for decodes.
+  final ReencodeRecord? reencode;
+
   /// Compression ratio (original / encoded).
   double get ratio =>
       encodedBytes <= 0 ? 1 : originalBytes / encodedBytes;
@@ -89,10 +99,14 @@ class HistoryRecord {
   int get savedBytes => originalBytes - encodedBytes;
 
   /// Creates a copy with the given fields replaced.
+  ///
+  /// [reencode] is null-keeps: pass a record to replace it; there is
+  /// no path that clears it (a re-encoded encode stays re-encoded).
   HistoryRecord copyWith({
     int? decodeCount,
     String? savedPath,
     bool? migrated,
+    ReencodeRecord? reencode,
   }) =>
       HistoryRecord(
         id: id,
@@ -110,6 +124,7 @@ class HistoryRecord {
         decodeCount: decodeCount ?? this.decodeCount,
         savedPath: savedPath ?? this.savedPath,
         migrated: migrated ?? this.migrated,
+        reencode: reencode ?? this.reencode,
       );
 
   /// Serialises the record to JSON.
@@ -129,9 +144,11 @@ class HistoryRecord {
         'decodeCount': decodeCount,
         'savedPath': savedPath,
         'migrated': migrated,
+        'reencode': reencode?.toJson(),
       };
 
-  /// Parses a record from JSON.
+  /// Parses a record from JSON. Records written before the re-encode
+  /// field existed (no `'reencode'` key) parse with [reencode] null.
   factory HistoryRecord.fromJson(Map<String, dynamic> json) => HistoryRecord(
         id: json['id'] as String,
         kind: HistoryKind.values.firstWhere(
@@ -151,6 +168,9 @@ class HistoryRecord {
         decodeCount: json['decodeCount'] as int? ?? 0,
         savedPath: json['savedPath'] as String?,
         migrated: json['migrated'] as bool? ?? false,
+        reencode: ReencodeRecord.fromJson(
+          json['reencode'] as Map<String, dynamic>?,
+        ),
       );
 
   /// Seeded demo: the 1.04 GB podcast master from the V7 design.

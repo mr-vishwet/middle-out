@@ -96,6 +96,19 @@ class SettingsScreen extends StatelessWidget {
                         value: settings.autoVerify,
                         onChanged: settings.setAutoVerify,
                       ),
+                      SwitchListTile.adaptive(
+                        title: const Text('Lossless only'),
+                        subtitle: const Text(
+                          'Never re-encode: a file that can’t reach 10:1 '
+                          'losslessly is a dead end, and the estimate '
+                          'shows the true lossless size.',
+                        ),
+                        value: settings.losslessOnly,
+                        onChanged: (value) async {
+                          await settings.setLosslessOnly(value);
+                          state.encode.applySettings(settings);
+                        },
+                      ),
                     ],
                   ),
                 ),

@@ -30,6 +30,7 @@ class FrameInspection {
     required this.encrypted,
     required this.barcode,
     required this.recoveredViaParity,
+    required this.isReencoded,
   });
 
   /// Total frames in the encode (data + parity). Parity counts one per
@@ -82,6 +83,16 @@ class FrameInspection {
 
   /// True when the frames were rendered as barcodes.
   final bool barcode;
+
+  /// True when the framed bytes are a lossy re-encoded copy: the
+  /// header SHA-256 (and [expectedSha256Hex]) describe the RE-ENCODED
+  /// bytes, and decoding gives back that lower-quality copy, not the
+  /// user's original file. Read from the [kFlagReencoded] bit on the
+  /// frames — the original's name/size/SHA are not in the frames at
+  /// all (the 100-byte header has no room), so they cannot be shown
+  /// here; they live only on the PDF cover and in the encoding
+  /// device's history.
+  final bool isReencoded;
 
   /// Global DATA indices the decoder will rebuild from parity.
   final List<int> recoveredViaParity;
@@ -229,6 +240,7 @@ class FrameInspector {
       encrypted: meta.isEncrypted,
       barcode: meta.isBarcode,
       recoveredViaParity: recovered..sort(),
+      isReencoded: meta.isReencoded,
     );
   }
 }
