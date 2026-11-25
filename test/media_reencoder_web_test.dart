@@ -9,6 +9,13 @@
 /// twice (1 data + 1 parity frame), so the PDF is ~2.08x the media.
 /// Pinned: reencodeTargetMediaBytes(3,105,557) == 142,519 B, and the
 /// finished PDF must land at or below 310,555 B.
+///
+/// @TestOn('browser') is load-bearing, not decorative: this file
+/// imports dart:js_interop + package:web directly, which do not
+/// compile on the VM — without it, `flutter test` (and CI's test job)
+/// fails at load time. The VM run reports "No tests ran", which is
+/// the correct outcome.
+@TestOn('browser')
 library;
 
 import 'dart:async';

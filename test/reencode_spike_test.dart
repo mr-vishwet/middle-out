@@ -1,6 +1,13 @@
 // SPIKE ONLY — evidence for the Middle Out 10:1 re-encode decision.
 // NOT production code. Do not import anything from here into lib/.
 //
+// @TestOn('browser') is load-bearing, not decorative: this file
+// imports dart:js_interop + package:web directly, which do not compile
+// on the VM — without it, `flutter test` (and CI's test job) fails at
+// load time. The VM run reports "No tests ran", which is the correct
+// outcome.
+@TestOn('browser')
+//
 // Proves (or disproves) in a REAL Chrome, with measured numbers, that
 // the app can re-encode video in-browser to hit a size target, using
 // WebCodecs VideoEncoder (browser-native, no big download), with
@@ -13,9 +20,14 @@
 // Targets (exact, not guessed):
 //   input            3,105,557 B
 //   PDF target       input / 10            = 310,555 B
-//   media budget     input / 13.3 (~33% parity + framing overhead)
-//                                  = 233,501 B
-//   => max avg video bitrate for the 20.08 s clip = ~93,000 bps.
+//   media budget     TRUE budget 142,519 B (Worker B's ratio engine —
+//   NOT the flat input/13.3 = 233,501 B the spike first used: a
+//   1-data-page encode carries the stream twice, so the PDF is
+//   ~2.08x the media). => max avg video bitrate for the 20.08 s
+//   clip = ~56,800 bps. The ladder numbers below were measured
+//   against the flat budget and are kept as evidence; the
+//   production encoder (media_reencoder_web_test.dart) is pinned
+//   against the true 142,519 B budget.
 // The re-encode quality floor in lib/codec/reencode.dart is
 // 426x240 @ 150 kbps, which alone is ~376 KB for this clip — already
 // over budget. The ladder below measures whether ANY bitrate/res
