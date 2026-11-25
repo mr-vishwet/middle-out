@@ -8,15 +8,15 @@ the whole page, logo tile in the centre of every code page).
 - `middle-out-sample-dark.pdf` — white code on a black page.
 
 Each is 3 pages: 1 cover + 2 code pages (1 data frame + 1 parity
-frame — the demo compresses to 8,303 bytes, a single chunk, and the
+frame — the demo compresses to 7,193 bytes, a single chunk, and the
 empty second trio emits no second parity, so there is no sparse page).
 The cover carries branding, file details only (name, size, format,
 theme, page count) and a scannable QR code to the Middle Out web app;
 no SHA-256, payload size, ratio or frame counts appear on it.
 
-Demo file: exactly 1,048,576 bytes of deterministic text (the repo
-README repeated 461 times with section markers),
-SHA-256 `e78a38dc1faafa0f9f8028feb41632503beae935517f31afac8e3ee32d42df55`.
+Demo file: exactly 1,023,420 bytes of deterministic text (the repo
+README, 2,220 bytes, repeated 461 times),
+SHA-256 `158094c25e9672aee2dc7fcdb6941873263619f63160129293a531189c0ba77b`.
 
 Settings: QR mode, encrypted ON. Sample passphrase:
 `middle-out-sample-2026` (needed to decode; the demo content is public

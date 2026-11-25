@@ -9,9 +9,12 @@ without a Flutter toolchain. The Dart side and this file MUST agree on:
   * the 100-byte v2 frame header layout (v1's 97-byte header still parses),
   * zlib level-9 compression of the whole file before chunking,
   * ChaCha20 (RFC 8439) with a PBKDF2-HMAC-SHA256 derived key,
-  * EQUAL-SPLIT framing: at most 20 data frames, the (compressed+
+  * EQUAL-SPLIT framing: at most 30 data frames, the (compressed+
     encrypted) stream divided into N equal chunks (the last zero-padded
-    to chunkSize), flag bit 0x08 on every frame; the decoder trims the
+    to chunkSize), flag bit 0x08 on every frame; N is ADAPTIVE —
+    data_page_count() grows it sub-linearly with the compressed size
+    (2 pages for a 20 MB file, 14 for 1 GB, 30 at ~4.3 GB and above),
+    so a fixed per-page size is never the rule; the decoder trims the
     reassembled stream to compressedSize before decrypt/decompress,
   * XOR parity: 6 DATA + 2 PARITY per group, trios (0,1,2) and (3,4,5);
     a parity frame is emitted ONLY when its trio has >= 1 data slot
@@ -80,21 +83,57 @@ PARITY_A_SLOT = 6
 PARITY_B_SLOT = 7
 
 DEFAULT_MAX_PAYLOAD = 65536
-# Equal-split cap: an encode never has more than 20 data frames, so
+# Equal-split cap: an encode never has more than 30 data frames, so
 # every code page is as dense as every other (no sparse near-empty
-# last page). N_data = min(20, ceil(streamLen / max_payload)),
+# last page). N_data = data_page_count(streamLen) — see below — and
 # chunkSize = ceil(streamLen / N_data); the last chunk is zero-padded
 # to chunkSize and the decoder trims the reassembled stream to
-# compressedSize. A 1 GB input at ~20 frames means ~50 MB frames —
-# the grid cap below (32768) is what bounds the page, not this.
-MAX_DATA_FRAMES = 20
+# compressedSize. A 1 GB input at 14 pages means ~77 MB frames, a
+# 50 GB input at 30 pages ~1.79 GB frames — the grid cap below
+# (131072) is what bounds the page, not this.
+MAX_DATA_FRAMES = 30
+# Page-count unit (5 MiB) for the adaptive rule: N =
+# round(sqrt(streamLen / PAGE_COUNT_UNIT)), clamped to [1, 30].
+# Exact integer arithmetic (math.isqrt + integer rounding), mirroring
+# Dart's Encoder.dataPageCount bit-for-bit. round, not ceil: zlib
+# ADDS bytes to incompressible data, so a 20 MiB file compresses to a
+# hair over 20,971,520 bytes — sqrt lands a hair over 2.0, and ceil
+# would wrongly give 3 pages. N reaches the 30-page cap at
+# streamLen = 871 units (~4.25 GiB).
+PAGE_COUNT_UNIT = 5 * 1024 * 1024
+
+
+def _isqrt(n: int) -> int:
+    """Floor of the square root of [n] (math.isqrt — exact integer
+    arithmetic, no floats, so no edge cases at the boundary)."""
+    return math.isqrt(n)
+
+
+def data_page_count(compressed_size: int) -> int:
+    """Adaptive DATA-page count for a compressed (+encrypted) stream of
+    [compressed_size] bytes — the single home of the page-count rule
+    (mirrors Dart's Encoder.dataPageCount; the estimate screen calls
+    the Dart one). Measured counts (incompressible inputs):
+
+        20 MiB  ->  2 pages (~10.5 MB each)
+         1 GiB  -> 14 pages (~76.7 MB each)
+        10 GiB  -> 30 pages, cap (~357.9 MB each)
+        50 GiB  -> 30 pages, cap (~1.79 GB each)
+    """
+    if compressed_size <= 0:
+        return 1
+    n = compressed_size // PAGE_COUNT_UNIT
+    r = _isqrt(n)
+    # Nearest integer to sqrt(n): round up iff n is closer to (r+1)^2.
+    rounded = r + 1 if (n - r * r) > ((r + 1) * (r + 1) - n) else r
+    return max(1, min(MAX_DATA_FRAMES, rounded))
 # Policy guardrail, not a format limit: v2 frame_index is uint16, so the
 # format can address 65,535 frames. 4096 covers the 1 GB hero case
 # (~300 frames) 13x over and the largest real-world report so far (a
 # 67 MB mp4 needing 1,125 frames) 3.6x over, while bounding the PDF at
 # ~250 MB and in-memory frame payloads at ~256 MB.
-# NOTE: with the 20-data-frame equal-split cap an encode can never
-# exceed 28 frames (20 data + 8 parity), so this guard is unreachable
+# NOTE: with the 30-data-frame equal-split cap an encode can never
+# exceed 40 frames (30 data + 10 parity), so this guard is unreachable
 # through encode() now — it stays as defence-in-depth.
 MAX_FRAMES = 4096
 
@@ -126,10 +165,14 @@ BARCODE_STRETCH = 4
 BARCODE_ASPECT = BARCODE_STRETCH * QR_ASPECT  # ~5.65685
 GRID_MIN_HEIGHT = 32
 GRID_HEIGHT_STEP = 2
-# Equal-split frames are much bigger than the old 64 KiB frames (a 1 GB
-# input splits into ~50 MB frames), so the grid height cap is 32768 —
-# the same value as the Dart side. A 5 MB frame needs h ~= 5450.
-GRID_MAX_HEIGHT = 32768
+# Equal-split frames are much bigger than the old 64 KiB frames (a 20 MB
+# input splits into ~10.5 MB frames, a 1 GB input into ~77 MB frames),
+# so the grid height cap is 131072 — the same value as the Dart side.
+# A 5 MB frame needs h ~= 5570, a 77 MB frame h ~= 21300, a 1.79 GB
+# frame (a 50 GB file at the 30-page cap) h ~= 102900. A 100 GB file
+# at 30 pages would need h ~= 145500 and is refused by this cap; its
+# route is the streaming encoder's fixed 64 KiB frames.
+GRID_MAX_HEIGHT = 131072
 
 # --- Centre logo tile (docs/screenshots/app-icon.png, verified by eye:
 # black rounded-square tile, white pixel-M, green dot) ---
@@ -598,21 +641,26 @@ class EncodeResult:
     barcode: bool = False
 
 
-def _split_equal(stream: bytes, max_payload: int) -> list[bytes]:
+def _split_equal(stream: bytes, max_payload: int | None = None) -> list[bytes]:
     """Equal-split chunking (mirrors Dart's Encoder._chunk exactly,
-    including the count re-derivation): N = min(20,
-    ceil(len / max_payload)) chunks of chunkSize = ceil(len / N); the
-    LAST chunk is zero-padded to chunkSize so every data frame (and
-    every parity frame) is the same width — every code page comes out
-    equally dense. The count is re-derived from the chunk size
+    including the count re-derivation): N = data_page_count(len)
+    chunks of chunkSize = ceil(len / N) — or, when [max_payload] is
+    given, N = min(30, ceil(len / max_payload)) (the legacy override,
+    used by tests to force multi-page shapes cheaply). The LAST chunk
+    is zero-padded to chunkSize so every data frame (and every parity
+    frame) is the same width — every code page comes out equally
+    dense. The count is re-derived from the chunk size
     (ceil(len / chunkSize)) so the last chunk is the only short one.
     An empty stream yields one empty chunk (one empty data frame, no
     parity — parity of nothing is nothing)."""
     if len(stream) == 0:
         return [b""]
-    unit = max(1, max_payload)
-    n_data = min(MAX_DATA_FRAMES, (len(stream) + unit - 1) // unit)
-    n_data = max(1, n_data)
+    if max_payload is None:
+        n_data = data_page_count(len(stream))
+    else:
+        unit = max(1, max_payload)
+        n_data = min(MAX_DATA_FRAMES, (len(stream) + unit - 1) // unit)
+        n_data = max(1, n_data)
     chunk_size = (len(stream) + n_data - 1) // n_data
     if chunk_size > 0:
         # Re-derive the count from the chunk size (see Dart's _chunk).
@@ -628,17 +676,20 @@ def encode(
     data: bytes,
     passphrase: str | None = None,
     *,
-    max_payload: int = DEFAULT_MAX_PAYLOAD,
+    max_payload: int | None = None,
     barcode: bool = False,
 ) -> EncodeResult:
     """Encode [data] into Middle Out frames.
 
     Pipeline: SHA-256 -> zlib-9 compress -> (optional ChaCha20 encrypt)
-    -> EQUAL-SPLIT into at most 20 equal chunks (last zero-padded) ->
-    group into 6 DATA + up to 2 XOR-parity. Every frame carries the
-    FLAG_EQUAL_SPLIT bit; a parity frame is emitted ONLY when its trio
-    has >= 1 data slot present, so a group with <= 3 data frames has
-    no P2 (and the empty-input edge has no parity at all).
+    -> EQUAL-SPLIT into at most 30 equal chunks (last zero-padded,
+    the count from data_page_count(); an explicit [max_payload]
+    overrides it with the legacy min(30, ceil(len / max_payload))
+    rule) -> group into 6 DATA + up to 2 XOR-parity. Every frame
+    carries the FLAG_EQUAL_SPLIT bit; a parity frame is emitted ONLY
+    when its trio has >= 1 data slot present, so a group with <= 3
+    data frames has no P2 (and the empty-input edge has no parity at
+    all).
     """
     sha = hashlib.sha256(data).digest()
     compressed = zlib.compress(data, 9)
@@ -879,7 +930,7 @@ def decode(frame_blobs: list[bytes], passphrase: str | None = None) -> bytes:
 # Visual codes: Middle Out Code grid + bar-grid barcode (+ legacy stacked rows)
 #
 # The frames are rendered as full-page codes. A real ISO QR code holds ~3 KB;
-# a Middle Out frame holds up to 64 KiB, so the 2D mode is a custom grid
+# a Middle Out frame holds up to ~1.79 GB, so the 2D mode is a custom grid
 # (QR-style finders, timing patterns, centre tile reserved for the logo)
 # rather than an ISO QR code. Barcode mode uses the SAME grid layout with a
 # 4x-stretched aspect: drawn into the full landscape page rect, the

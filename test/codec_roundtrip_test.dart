@@ -273,7 +273,7 @@ void main() {
       // 13 MiB of incompressible data in FIXED 64 KiB chunks needs
       // ~278 frames — over the old 256 cap, under the 4096 cap. Fixed
       // chunks come from buildFrames directly now (the in-memory path
-      // equal-splits into at most 20 data frames); the streaming path
+      // equal-splits into at most 30 data frames); the streaming path
       // still frames this way, and the v2 uint16 indices must hold.
       final random = Random(1234);
       final data = Uint8List(13 * 1024 * 1024);
@@ -339,11 +339,16 @@ void main() {
 
   group('equal-split encode', () {
     test('200 KiB random payload splits into 4 dense data pages', () {
+      // Explicit 64 KiB unit forces 4 pages: under the default adaptive
+      // rule 200 KiB is 1 page (dataPageCount: 200 KiB < 15 MiB). The
+      // equal-split mechanics — equal chunks, zero-padded last chunk,
+      // flag on every frame — are what this test proves, not the
+      // default count.
       final random = Random(7);
       final data = Uint8List.fromList(
         List<int>.generate(200 * 1024, (_) => random.nextInt(256)),
       );
-      final result = Encoder.encode(data);
+      final result = Encoder.encode(data, maxPayload: 64 * 1024);
       final dataFrames = [
         for (final f in result.frames)
           if (f.isData) f,
@@ -430,26 +435,92 @@ void main() {
       );
     });
 
-    test('20 data pages max, however large the file', () {
-      // 2 MiB of random data would need 32 fixed chunks — equal-split
-      // caps it at 20 dense data frames.
+    test('30 data pages max, however large the file', () {
+      // 2 MiB of random data would need 33 fixed chunks — equal-split
+      // caps it at 30 dense data frames. The count is forced with an
+      // explicit 64 KiB unit: under the default adaptive rule 2 MiB
+      // is 1 page, so the cap itself is only reachable cheaply this way
+      // (a real 4.3 GB input would be needed otherwise).
       final random = Random(13);
       final data = Uint8List.fromList(
         List<int>.generate(2 * 1024 * 1024, (_) => random.nextInt(256)),
       );
-      final result = Encoder.encode(data);
+      final result = Encoder.encode(data, maxPayload: 64 * 1024);
       expect(
         result.frames.where((f) => f.isData).length,
-        20,
+        30,
       );
-      expect(result.stats.groupCount, 4);
-      // 3 full groups (2 parities each) + a 2-data group (1 parity).
-      expect(result.frames.length, 27);
+      expect(result.stats.groupCount, 5);
+      // 5 full groups (2 parities each) = 30 data + 10 parity.
+      expect(result.frames.length, 40);
       expect(
         Decoder.decode([for (final f in result.frames) f.toBytes()]),
         data,
       );
     });
+
+    test('dataPageCount grows sub-linearly with compressed size', () {
+      // Pure function — the whole adaptive rule, table-driven. The
+      // 20,971,530 case is the zlib-overhead trap: a 20 MiB
+      // incompressible file compresses to a hair over 20,971,520 bytes,
+      // and round (not ceil) keeps it on 2 pages.
+      const cases = {
+        0: 1,
+        100 * 1024: 1,
+        5 * 1024 * 1024: 1,
+        15 * 1024 * 1024: 2,
+        20 * 1024 * 1024: 2,
+        20971530: 2,
+        35 * 1024 * 1024: 3,
+        100 * 1024 * 1024: 4,
+        1073741824: 14,
+        4566548480: 30,
+        10737418240: 30,
+        53687091200: 30,
+      };
+      for (final entry in cases.entries) {
+        expect(
+          Encoder.dataPageCount(entry.key),
+          entry.value,
+          reason: 'compressedSize ${entry.key}',
+        );
+      }
+      // The Python reference must agree exactly (byte-identical
+      // chunking depends on it) — spot-check the documented sizes.
+      expect(Encoder.dataPageCount(20971520), 2);
+      expect(Encoder.dataPageCount(1073741824), 14);
+    });
+
+    test('20 MiB incompressible file lands on 2 data pages', () {
+      // The acceptance case: a real 20.1 MB mp4 encoded to 28 PDF
+      // pages under the old 64 KiB-unit rule; under the adaptive rule
+      // it is 2 data + 1 parity = 3 code pages + cover = 4 PDF pages.
+      // Random bytes stand in for the mp4 (already entropy-coded,
+      // zlib cannot shrink it — that is information theory).
+      final random = Random(21);
+      final data = Uint8List.fromList(
+        List<int>.generate(20 * 1024 * 1024, (_) => random.nextInt(256)),
+      );
+      final result = Encoder.encode(data);
+      final dataFrames = [
+        for (final f in result.frames)
+          if (f.isData) f,
+      ];
+      expect(dataFrames.length, 2);
+      // One group of 6 slots, 2 used: P1 emitted, P2 skipped
+      // (empty trio) — 3 frames total.
+      expect(result.frames.length, 3);
+      expect(result.stats.groupCount, 1);
+      // Both data frames carry the full chunk size (~10.5 MB each).
+      final chunkSize = (result.stats.compressedSize + 1) ~/ 2;
+      for (final frame in dataFrames) {
+        expect(frame.payload.length, chunkSize);
+      }
+      expect(
+        Decoder.decode([for (final f in result.frames) f.toBytes()]),
+        data,
+      );
+    }, timeout: const Timeout(Duration(minutes: 5)));
   });
 
   // ByteData.getUint64/setUint64 throw UnsupportedError under dart2js

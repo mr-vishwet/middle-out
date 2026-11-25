@@ -311,17 +311,47 @@ class PreEncodeScreen extends StatelessWidget {
                   ),
                 ],
                 const SizedBox(height: 24),
-                FilledButton(
-                  onPressed: () {
-                    Navigator.of(context)
-                        .pushNamed(AppRoutes.encodeProgress);
-                  },
-                  child: const Text('Encode to PDF'),
-                ),
+                _EncodeButton(controller: controller),
               ],
             ),
           );
         },
+      ),
+    );
+  }
+}
+
+/// The Encode button: blocked when the memory guard refuses, two-tap
+/// when it warns (first tap acknowledges the warning, second encodes).
+class _EncodeButton extends StatelessWidget {
+  /// Creates the encode button.
+  const _EncodeButton({required this.controller});
+
+  /// Encode controller.
+  final EncodeController controller;
+
+  @override
+  Widget build(BuildContext context) {
+    final guard = controller.estimate?.memoryGuard;
+    final blocked = guard?.level == MemoryGuardLevel.refuse;
+    final needsAck = guard?.level == MemoryGuardLevel.warn &&
+        !controller.memoryWarningAcknowledged;
+    return FilledButton(
+      onPressed: blocked
+          ? null
+          : () {
+              if (needsAck) {
+                controller.acknowledgeMemoryWarning();
+                return;
+              }
+              Navigator.of(context).pushNamed(AppRoutes.encodeProgress);
+            },
+      child: Text(
+        blocked
+            ? 'Too large for this device'
+            : needsAck
+                ? 'Encode anyway'
+                : 'Encode to PDF',
       ),
     );
   }
@@ -345,7 +375,13 @@ class _EstimateRows extends StatelessWidget {
         Text('Estimate', style: theme.textTheme.titleMedium),
         const SizedBox(height: 8),
         _row(theme, 'Ratio', formatRatio(estimate.ratio)),
-        _row(theme, 'Frames', '${estimate.estimatedFrames}'),
+        _row(
+          theme,
+          'Frames',
+          '${estimate.estimatedFrames} '
+          '(${estimate.dataFrames} data + '
+          '${estimate.parityFrames} parity)',
+        ),
         _row(
           theme,
           'PDF size',
@@ -356,6 +392,13 @@ class _EstimateRows extends StatelessWidget {
           'Time',
           'about ${formatDuration(estimate.estimatedSeconds)}',
         ),
+        if (estimate.memoryGuard.estimatedPeakBytes > 0 &&
+            estimate.memoryGuard.level != MemoryGuardLevel.ok)
+          _row(
+            theme,
+            'Peak memory',
+            'about ${formatBytes(estimate.memoryGuard.estimatedPeakBytes)}',
+          ),
         const SizedBox(height: 4),
         Text(
           controller.file != null &&
@@ -366,6 +409,25 @@ class _EstimateRows extends StatelessWidget {
                   'extrapolated — real ratios depend on the file.',
           style: theme.textTheme.bodySmall,
         ),
+        if (estimate.incompressible) ...[
+          const SizedBox(height: 12),
+          Text(
+            "This file is already compressed, so the PDF will be about "
+            "the same size as the file — it can't get smaller.",
+            style: theme.textTheme.bodyMedium,
+          ),
+        ],
+        if (estimate.memoryGuard.level != MemoryGuardLevel.ok) ...[
+          const SizedBox(height: 12),
+          Text(
+            estimate.memoryGuard.reason,
+            style: theme.textTheme.bodyMedium?.copyWith(
+              color: estimate.memoryGuard.level == MemoryGuardLevel.refuse
+                  ? theme.colorScheme.error
+                  : null,
+            ),
+          ),
+        ],
         if (estimate.overCap) ...[
           const SizedBox(height: 12),
           Text(
@@ -497,7 +559,9 @@ class _EncodingScreenState extends State<EncodingScreen> {
                 if (controller.estimate != null) ...[
                   const SizedBox(height: 24),
                   Text(
-                    'About ${controller.estimate!.estimatedFrames} frames · '
+                    'About ${controller.estimate!.estimatedFrames} frames '
+                    '(${controller.estimate!.dataFrames} data + '
+                    '${controller.estimate!.parityFrames} parity) · '
                     'about ${formatBytes(controller.estimate!.estimatedPdfBytes)}',
                     style: theme.textTheme.bodyMedium,
                     textAlign: TextAlign.center,

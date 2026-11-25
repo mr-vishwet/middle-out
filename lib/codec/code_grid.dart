@@ -5,10 +5,11 @@ import 'frame.dart';
 
 /// The visual codes: a Middle Out Code grid (2D) and a stacked-row barcode.
 ///
-/// A real ISO QR code holds ~3 KB; a Middle Out frame holds up to tens
-/// of MB (equal-split encodes divide the stream into at most 20 chunks),
-/// so the 2D mode is a custom grid — QR-style finders, timing patterns and
-/// a centre tile reserved for the logo — rather than an ISO QR code.
+/// A real ISO QR code holds ~3 KB; a Middle Out frame holds up to
+/// ~1.7 GB (equal-split encodes divide the stream into at most 30
+/// adaptive chunks — see `Encoder.dataPageCount` in encoder.dart), so the 2D mode is a
+/// custom grid — QR-style finders, timing patterns and a centre tile
+/// reserved for the logo — rather than an ISO QR code.
 /// Barcode mode draws the same grid stretched 4x wide, so the modules
 /// become tall thin bars ([barcodeAspect]); the old stacked-row barcode
 /// ([buildBarcodeRows]/[parseBarcodeRows]) is kept only so PDFs encoded
@@ -31,10 +32,19 @@ class CodeGrid {
   /// Grid height grows in steps of this many modules.
   static const int step = 2;
 
-  /// Largest grid height in modules. A 5 MB frame needs h ~ 5,450 and a
-  /// 50 MB frame h ~ 16,800 (QR aspect); 32,768 covers a ~190 MB frame
-  /// at QR aspect. Mirrors the Python reference's cap.
-  static const int maxHeight = 32768;
+  /// Largest grid height in modules. A 5 MB frame needs h ~ 5,600, a
+  /// 10.5 MB frame h ~ 7,880 and a 77 MB frame (the densest page of a
+  /// 1 GB encode) h ~ 21,300 — all far below this. 131,072 covers a
+  /// ~2.9 GB frame at QR aspect: a 50 GB file at the 30-page cap needs
+  /// h ~ 102,900 for its ~1.79 GB pages. The cap is a format
+  /// guardrail, not a memory bound — the streaming renderer
+  /// ([packGrid]) holds one page as packed bytes (~1 byte per 8 cells
+  /// plus the deflate buffers), and the memory guard refuses
+  /// in-memory builds long before a 2.9 GB page is attempted. A 100 GB
+  /// file at 30 pages would need h ~ 145,500 and is refused by this
+  /// cap; its route is the streaming encoder's fixed 64 KiB frames.
+  /// Mirrors the Python reference's cap.
+  static const int maxHeight = 131072;
 
   /// Quiet-zone width around a grid, in modules. Code pages are
   /// full-bleed (no quiet zone); the cover QR keeps one — a QR without
@@ -159,11 +169,23 @@ class CodeGrid {
     }
   }
 
-  /// Renders [payload] into a w x h module matrix at the given [aspect]
-  /// (default the QR page aspect). Square grids (aspect 1.0) use the
-  /// same layout rules, so old square grids are the same format, not a
-  /// special case.
-  static List<Uint8List> buildGrid(
+  /// Renders [payload] into packed 1-bit rows at the given [aspect]
+  /// (default the QR page aspect) — the streaming renderer.
+  ///
+  /// The grid math is O(1) arithmetic per cell ([isReserved],
+  /// [centreTile]), so each row's bits are computed on the fly and
+  /// packed 8-per-byte instead of materialising the full w x h matrix
+  /// of one-byte-per-cell: a 10.5 MB frame's matrix is ~88 MB of
+  /// [Uint8List] rows, while the packed bytes are ~10.5 MB. Per-page
+  /// memory is O(image bytes), not O(cells x bool). The returned bits
+  /// are the module bits themselves (1 = black module, 0 = white,
+  /// pad bits past the row width zero); [PngEncode.deflatePacked]
+  /// applies the DeviceGray inversion.
+  ///
+  /// This is the single bit-layout implementation: [buildGrid] unpacks
+  /// these bytes into a matrix, so the two can never drift — the
+  /// golden-hash tests on [buildGrid] prove this path bit-identical.
+  static ({Uint8List bytes, int width, int height}) packGrid(
     Uint8List payload, {
     double aspect = qrAspect,
   }) {
@@ -174,9 +196,17 @@ class CodeGrid {
       ..add(payload);
     final bytes = blob.toBytes();
     final (w, h) = chooseGridSize(payload.length, aspect: aspect);
-    final grid = List<Uint8List>.generate(h, (_) => Uint8List(w));
     final (centreStartRow, centreStartCol, centreTileW, centreTileH) =
         centreTile(w, h);
+    final stride = (w + 7) ~/ 8;
+    final packed = Uint8List(h * stride);
+
+    // Set one black module bit. Only ever called for 1-bits: packed
+    // defaults to zero, so white modules (and the centre tile, which
+    // stays blank for the logo) need no write.
+    void setBit(int r, int c) {
+      packed[r * stride + c ~/ 8] |= 1 << (7 - c % 8);
+    }
 
     // Finder patterns: 7x7, outer ring black, middle ring white, 3x3 core.
     for (final (r0, c0) in [(0, 0), (0, w - 7), (h - 7, 0)]) {
@@ -184,22 +214,26 @@ class CodeGrid {
         for (var dc = 0; dc < 7; dc++) {
           final onRing = dr == 0 || dr == 6 || dc == 0 || dc == 6;
           final inCore = dr >= 2 && dr <= 4 && dc >= 2 && dc <= 4;
-          grid[r0 + dr][c0 + dc] = (onRing || inCore) ? 1 : 0;
+          if (onRing || inCore) setBit(r0 + dr, c0 + dc);
         }
       }
     }
-    // Timing row/column 6, alternating starting black.
-    for (var i = 8; i < w - 8; i++) {
-      grid[6][i] = i % 2 == 0 ? 1 : 0;
+    // Timing row/column 6, alternating starting black (even indices).
+    for (var i = 8; i < w - 8; i += 2) {
+      setBit(6, i);
     }
-    for (var i = 8; i < h - 8; i++) {
-      grid[i][6] = i % 2 == 0 ? 1 : 0;
+    for (var i = 8; i < h - 8; i += 2) {
+      setBit(i, 6);
     }
 
-    // Data bits, row-major over the placeable cells, MSB first.
+    // Data bits, row-major over the placeable cells, MSB first. The
+    // bit math is inlined (not a per-cell closure call): a 77 MB
+    // frame walks ~640M cells, and the closure call would dominate.
     var bitIndex = 0;
     final totalBits = bytes.length * 8;
+    outer:
     for (var r = 0; r < h; r++) {
+      final rowBase = r * stride;
       for (var c = 0; c < w; c++) {
         if (isReserved(
           r,
@@ -213,13 +247,51 @@ class CodeGrid {
         )) {
           continue;
         }
-        if (bitIndex >= totalBits) return grid;
-        final byte = bytes[bitIndex ~/ 8];
-        grid[r][c] = (byte >> (7 - bitIndex % 8)) & 1;
+        if (bitIndex >= totalBits) break outer;
+        if ((bytes[bitIndex ~/ 8] >> (7 - bitIndex % 8)) & 1 == 1) {
+          packed[rowBase + c ~/ 8] |= 1 << (7 - c % 8);
+        }
         bitIndex++;
       }
     }
-    return grid;
+    return (bytes: packed, width: w, height: h);
+  }
+
+  /// Packs the frame grid for [payload]: the bar-grid when [barcode],
+  /// the QR grid otherwise. The streaming counterpart of
+  /// [buildFrameGrid], used by the PDF builder.
+  static ({Uint8List bytes, int width, int height}) packFrameGrid(
+    Uint8List payload, {
+    required bool barcode,
+  }) =>
+      packGrid(payload, aspect: barcode ? barcodeAspect : qrAspect);
+
+  /// Renders [payload] into a w x h module matrix at the given [aspect]
+  /// (default the QR page aspect). Square grids (aspect 1.0) use the
+  /// same layout rules, so old square grids are the same format, not a
+  /// special case.
+  ///
+  /// Unpacks [packGrid]: the matrix is only a view of the packed bits,
+  /// kept for previews, tests and the legacy stacked-row tooling. The
+  /// PDF builder never calls this — it streams [packGrid] straight
+  /// into [PngEncode.deflatePacked].
+  static List<Uint8List> buildGrid(
+    Uint8List payload, {
+    double aspect = qrAspect,
+  }) {
+    final packed = packGrid(payload, aspect: aspect);
+    final w = packed.width;
+    final h = packed.height;
+    final stride = (w + 7) ~/ 8;
+    final bytes = packed.bytes;
+    return List<Uint8List>.generate(h, (r) {
+      final row = Uint8List(w);
+      final rowBase = r * stride;
+      for (var c = 0; c < w; c++) {
+        row[c] = (bytes[rowBase + c ~/ 8] >> (7 - c % 8)) & 1;
+      }
+      return row;
+    });
   }
 
   /// Builds the frame grid for [payload]: the bar-grid when [barcode],

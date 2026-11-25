@@ -4,7 +4,7 @@
 Run:  python3 test_codec_reference.py
 
 Covers: ChaCha20 RFC 8439 vector, encode/decode round-trip (plain +
-encrypted, grid + barcode), equal-split framing (20-frame cap, zero-
+encrypted, grid + barcode), equal-split framing (30-frame cap, zero-
 padded last chunk, parity only for non-empty trios, 1-data-group
 recovery, old-format fixed-chunk frames still decoding), parity
 recovery (one lost frame per trio), failure modes (two lost in a trio,
@@ -229,32 +229,83 @@ class RoundTripTests(unittest.TestCase):
         ]
         self.assertEqual(mo.decode(blobs), data)
 
-    def test_large_file_caps_at_twenty_data_frames(self):
-        # Equal-split caps an encode at 20 data frames: 13 MiB of
-        # incompressible data splits into 20 equal ~682 KiB chunks
-        # (plus parity), NOT ~208 fixed 64 KiB frames — every code page
+    def test_large_file_caps_at_thirty_data_frames(self):
+        # Equal-split caps an encode at 30 data frames: 5 MiB of
+        # incompressible data with a 1 KiB unit would need ~5,120
+        # chunks, but the cap holds it to 30 equal chunks (plus
+        # parity), NOT ~5,120 fixed 64 KiB frames — every code page
         # is equally dense. (The old >256-frame test is obsolete: the
         # cap makes it unreachable through encode(); uint16 indices
         # above 255 are still covered by
         # test_v2_header_roundtrips_indices_above_255.)
-        data = os.urandom(13 * 1024 * 1024)
-        result = mo.encode(data)
+        # The cap is forced with an explicit small max_payload: under
+        # the default adaptive rule a 4.3 GB input would be needed to
+        # reach it, which no unit test should allocate.
+        data = os.urandom(5 * 1024 * 1024)
+        result = mo.encode(data, max_payload=1024)
         data_frames = [f for f in result.frames if f.is_data]
-        self.assertEqual(len(data_frames), 20)
-        chunk_size = (result.stats.compressed_size + 19) // 20
+        self.assertEqual(len(data_frames), 30)
+        chunk_size = (result.stats.compressed_size + 29) // 30
         self.assertTrue(all(len(f.payload) == chunk_size for f in data_frames))
+        self.assertEqual(result.stats.group_count, 5)
+        # 5 full groups (2 parities each) = 30 data + 10 parity.
+        self.assertEqual(len(result.frames), 40)
         self.assertEqual(
             mo.decode([f.to_bytes() for f in result.frames]), data
         )
 
-    def test_small_max_payload_still_caps_at_twenty(self):
-        # Even a 1 KiB max_payload cannot force more than 20 data
+    def test_small_max_payload_still_caps_at_thirty(self):
+        # Even a 1 KiB max_payload cannot force more than 30 data
         # frames: the cap, not the payload size, bounds the frame count.
         # (The old over-cap test is obsolete for the same reason.)
         data = os.urandom(5 * 1024 * 1024)
         result = mo.encode(data, max_payload=1024)
         data_frames = [f for f in result.frames if f.is_data]
-        self.assertEqual(len(data_frames), 20)
+        self.assertEqual(len(data_frames), 30)
+        self.assertEqual(
+            mo.decode([f.to_bytes() for f in result.frames]), data
+        )
+
+    def test_data_page_count_grows_sublinearly(self):
+        # Pure function — the whole adaptive rule, table-driven. The
+        # 20,971,530 case is the zlib-overhead trap: a 20 MiB
+        # incompressible file compresses to a hair over 20,971,520
+        # bytes, and round (not ceil) keeps it on 2 pages. Must agree
+        # with Dart's Encoder.dataPageCount exactly — byte-identical
+        # chunking depends on it.
+        cases = {
+            0: 1,
+            100 * 1024: 1,
+            5 * 1024 * 1024: 1,
+            15 * 1024 * 1024: 2,
+            20 * 1024 * 1024: 2,
+            20971530: 2,
+            35 * 1024 * 1024: 3,
+            100 * 1024 * 1024: 4,
+            1073741824: 14,
+            4566548480: 30,
+            10737418240: 30,
+            53687091200: 30,
+        }
+        for size, want in cases.items():
+            self.assertEqual(
+                mo.data_page_count(size), want, f"compressedSize {size}"
+            )
+
+    def test_twenty_mib_file_lands_on_two_data_pages(self):
+        # The acceptance case: a real 20.1 MB mp4 encoded to 28 PDF
+        # pages under the old 64 KiB-unit rule; under the adaptive rule
+        # it is 2 data + 1 parity = 3 code pages + cover = 4 PDF pages.
+        data = os.urandom(20 * 1024 * 1024)
+        result = mo.encode(data)
+        data_frames = [f for f in result.frames if f.is_data]
+        self.assertEqual(len(data_frames), 2)
+        # One group of 6 slots, 2 used: P1 emitted, P2 skipped
+        # (empty trio) — 3 frames total.
+        self.assertEqual(len(result.frames), 3)
+        self.assertEqual(result.stats.group_count, 1)
+        chunk_size = (result.stats.compressed_size + 1) // 2
+        self.assertTrue(all(len(f.payload) == chunk_size for f in data_frames))
         self.assertEqual(
             mo.decode([f.to_bytes() for f in result.frames]), data
         )
@@ -334,11 +385,14 @@ def _old_style_encode(data, max_payload=mo.DEFAULT_MAX_PAYLOAD):
 
 class EqualSplitTests(unittest.TestCase):
     def test_equal_split_chunking(self):
-        # 200 KiB of random data: N = ceil(compressed/65536) = 4 equal
-        # chunks of ceil(compressed/4); the last is padded to the same
-        # width, so all four data payloads are equal.
+        # 200 KiB of random data with an explicit 64 KiB unit:
+        # N = ceil(compressed/65536) = 4 equal chunks of
+        # ceil(compressed/4); the last is padded to the same width, so
+        # all four data payloads are equal. (The default adaptive rule
+        # gives 1 page for 200 KiB; the unit is explicit here so the
+        # test still exercises multi-page equal splitting.)
         data = os.urandom(200_000)
-        result = mo.encode(data)
+        result = mo.encode(data, max_payload=65536)
         data_frames = [f for f in result.frames if f.is_data]
         self.assertEqual(len(data_frames), 4)
         chunk_size = (result.stats.compressed_size + 3) // 4
@@ -352,17 +406,20 @@ class EqualSplitTests(unittest.TestCase):
         self.assertEqual(mo.decode([f.to_bytes() for f in result.frames]), data)
 
     def test_equal_split_multi_page_roundtrip(self):
-        # 1 MiB random -> 17 data frames in 3 groups (6+6+5), 6 parity
-        # frames: every group has both trios non-empty, so P2 exists
-        # in all three groups. (N is computed from the actual
-        # compressed size — stored-block overhead pushes 1 MiB of
-        # random data just past 16 x 64 KiB.)
+        # 1 MiB random with an explicit 64 KiB unit -> 17 data frames
+        # in 3 groups (6+6+5), 6 parity frames: every group has both
+        # trios non-empty, so P2 exists in all three groups. (N is
+        # computed from the actual compressed size — stored-block
+        # overhead pushes 1 MiB of random data just past 16 x 64 KiB.
+        # The default adaptive rule gives 1 page for 1 MiB; the unit
+        # is explicit here so the test still exercises multi-group
+        # equal splitting.)
         data = os.urandom(1024 * 1024)
-        result = mo.encode(data)
+        result = mo.encode(data, max_payload=65536)
         data_frames = [f for f in result.frames if f.is_data]
         parity_frames = [f for f in result.frames if not f.is_data]
         expect_n = min(
-            20,
+            30,
             (result.stats.compressed_size + mo.DEFAULT_MAX_PAYLOAD - 1)
             // mo.DEFAULT_MAX_PAYLOAD,
         )
@@ -387,9 +444,10 @@ class EqualSplitTests(unittest.TestCase):
 
     def test_three_data_frames_have_no_p2(self):
         # Exactly 3 data frames fill trio A and leave trio B empty:
-        # P1 yes, P2 no.
+        # P1 yes, P2 no. (Explicit 64 KiB unit: the default adaptive
+        # rule gives 1 page for ~186 KiB.)
         data = os.urandom(3 * mo.DEFAULT_MAX_PAYLOAD - 10_000)
-        result = mo.encode(data)
+        result = mo.encode(data, max_payload=65536)
         data_frames = [f for f in result.frames if f.is_data]
         self.assertEqual(len(data_frames), 3)
         self.assertEqual(len(result.frames), 4)  # 3 data + P1
@@ -402,9 +460,11 @@ class EqualSplitTests(unittest.TestCase):
     def test_lose_padded_last_frame_recovers(self):
         # Dropping the last (zero-padded) data frame must rebuild it
         # and trim it to its true short length — the padded bytes must
-        # never reach the decompressor.
+        # never reach the decompressor. (Explicit 64 KiB unit so there
+        # are 4 data frames and the dropped index 3 is the padded last
+        # one; the default adaptive rule gives 1 page for 200 KiB.)
         data = os.urandom(200_000)
-        result = mo.encode(data)
+        result = mo.encode(data, max_payload=65536)
         blobs = [
             f.to_bytes()
             for f in result.frames
@@ -441,11 +501,11 @@ class EqualSplitTests(unittest.TestCase):
         self.assertEqual(mo.decode(blobs), data)
 
     def test_big_frame_grid_roundtrip(self):
-        # A 5 MB frame (the equal-split scale: a 100 MB file splits
-        # into ~5 MB frames) builds and parses through the raised
-        # 32768 grid cap. Timed — the build time is reported, not
-        # asserted, so a slow machine fails loudly by timeout instead
-        # of silently passing on a small grid.
+        # A 5 MB frame builds and parses through the raised 131072
+        # grid cap. (The equal-split scale: a 20 MB file splits into
+        # ~10.5 MB frames, a 1 GB file into ~77 MB frames.) Timed — the
+        # build time is reported, not asserted, so a slow machine fails
+        # loudly by timeout instead of silently passing on a small grid.
         import time
 
         raw = os.urandom(5 * 1024 * 1024)
@@ -1139,13 +1199,15 @@ class PdfTests(unittest.TestCase):
 
     def test_pdf_equal_split_roundtrips_light_dark_qr_barcode(self):
         # All 4 combinations, with equal-split frames: 64 KiB of random
-        # data compresses to ~64 KiB, which splits into 2 equal
-        # ~32 KiB data frames + P1 (trio B empty, no P2) = 3 frames.
+        # data compresses to ~64 KiB, which splits (explicit 64 KiB
+        # unit — the default adaptive rule gives 1 page for 64 KiB)
+        # into 2 equal ~32 KiB data frames + P1 (trio B empty, no P2)
+        # = 3 frames.
         data = os.urandom(64 * 1024)
         for barcode in (False, True):
             for dark in (False, True):
                 with self.subTest(barcode=barcode, dark=dark):
-                    result = mo.encode(data, barcode=barcode)
+                    result = mo.encode(data, max_payload=65536, barcode=barcode)
                     self.assertEqual(len(result.frames), 3)
                     data_frames = [f for f in result.frames if f.is_data]
                     self.assertEqual(len(data_frames), 2)
@@ -1160,12 +1222,18 @@ class PdfTests(unittest.TestCase):
     def test_pdf_dart_samples_decode(self):
         # Cross-check: the Dart-built samples in docs/samples/ decode
         # through the Python extractor + decoder to the demo file
-        # (SHA-256 from docs/samples/README.md, passphrase published
-        # there on purpose). The samples predate the equal-split
-        # redesign, so this also proves old-format PDFs still decode;
-        # when the Dart worker rebuilds them in the new format this
-        # test proves the two sides agree byte-for-byte.
-        demo_sha = "e78a38dc1faafa0f9f8028feb41632503beae935517f31afac8e3ee32d42df55"
+        # (the CURRENT repo README repeated 461 times — see
+        # docs/samples/README.md; passphrase published there on
+        # purpose). The expected bytes are computed from the README
+        # at test time so the check tracks README edits instead of
+        # pinning a stale demo: the old 1,048,576-byte demo
+        # (SHA e78a38dc…) predates the current README and is gone.
+        readme_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "README.md",
+        )
+        with open(readme_path, "rb") as fh:
+            demo = fh.read() * 461
+        demo_sha = hashlib.sha256(demo).hexdigest()
         for name in ("middle-out-sample-light.pdf", "middle-out-sample-dark.pdf"):
             fixture = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
@@ -1175,7 +1243,7 @@ class PdfTests(unittest.TestCase):
                 if not os.path.exists(fixture):
                     self.skipTest("Dart sample not present")
                 data = mo.decode_pdf(fixture, "middle-out-sample-2026")
-                self.assertEqual(len(data), 1_048_576)
+                self.assertEqual(len(data), len(demo))
                 self.assertEqual(hashlib.sha256(data).hexdigest(), demo_sha)
 
     def test_pdf_old_format_grid_still_decodes(self):

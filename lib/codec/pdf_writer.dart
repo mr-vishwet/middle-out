@@ -68,10 +68,24 @@ class RawPdfWriter {
   /// given, every frame page draws it over the grid's centre tile. One
   /// shared XObject serves all frame pages, so the tile costs ~2 KB
   /// per document, not per page.
+  ///
+  /// [totalPages] enables eager (streaming) mode: when the caller knows
+  /// the final page count up front ([PdfDocument.build] does — cover +
+  /// one page per frame), each [addCoverPage]/[addFramePage] serialises
+  /// its page's objects into the output immediately and drops the
+  /// image bytes, instead of holding every page until [build]. The
+  /// caller must then add exactly [totalPages] pages, in final order;
+  /// [build] throws [StateError] otherwise. The output bytes are
+  /// identical to the lazy path for the same pages (proven by the
+  /// eager/lazy test in `pdf_writer_test.dart`).
+  ///
+  /// Without [totalPages] the writer keeps the old behaviour (collect
+  /// pages, serialise in [build]) — used by tests and tooling.
   RawPdfWriter({
     Uint8List? logoDeflate,
     this.logoWidth = 64,
     this.logoHeight = 64,
+    this.totalPages,
   }) : _logoDeflate = logoDeflate;
 
   /// Logo tile width in pixels.
@@ -80,9 +94,26 @@ class RawPdfWriter {
   /// Logo tile height in pixels.
   final int logoHeight;
 
+  /// Declared final page count, when eager mode is on (null = lazy).
+  final int? totalPages;
+
+  /// True when this writer streams pages as they are added.
+  bool get _eager => totalPages != null;
+
   final Uint8List? _logoDeflate;
 
   final _pages = <_RawPdfPage>[];
+
+  // Eager-mode serialisation state. [_out]/[_offsets] are created by
+  // [_beginEager] on the first added page; [_pageObjs] holds the
+  // precomputed object numbers for all [totalPages] pages (the Pages
+  // object lists every page's object number, so the count must be
+  // known before the first page is written).
+  BytesBuilder? _out;
+  List<int>? _offsets;
+  int? _logoObj;
+  List<(int, int, int)>? _pageObjs;
+  int _eagerAdded = 0;
 
   /// Adds the cover page: logo tile, "MIDDLE OUT" wordmark, [detailLines]
   /// (file name, original size, format, theme, page count — nothing
@@ -96,7 +127,7 @@ class RawPdfWriter {
     required int imageHeight,
     required Uint8List imageDeflate,
   }) {
-    _pages.add(
+    _addPage(
       _RawPdfPage.cover(
         detailLines: detailLines,
         imageWidth: imageWidth,
@@ -118,7 +149,7 @@ class RawPdfWriter {
     required Uint8List imageDeflate,
     bool dark = false,
   }) {
-    _pages.add(
+    _addPage(
       _RawPdfPage.frame(
         imageWidth: imageWidth,
         imageHeight: imageHeight,
@@ -128,49 +159,101 @@ class RawPdfWriter {
     );
   }
 
+  /// Adds [page]: in lazy mode it is collected for [build]; in eager
+  /// mode it is serialised into the output immediately — the image
+  /// bytes are copied into the page's image object, so the writer
+  /// holds no reference to the caller's image buffer after this call
+  /// returns and the caller can reuse or drop it. The PDF content
+  /// itself (one copy per page, inside the output buffer) is
+  /// unavoidable: it IS the document being built.
+  void _addPage(_RawPdfPage page) {
+    if (!_eager) {
+      _pages.add(page);
+      return;
+    }
+    if (_eagerAdded >= totalPages!) {
+      throw StateError(
+        'RawPdfWriter: eager mode declared $totalPages pages but a '
+        '${_eagerAdded + 1}th page was added',
+      );
+    }
+    _beginEager();
+    _writePage(_out!, _offsets!, page, _pageObjs![_eagerAdded], _logoObj);
+    _eagerAdded++;
+  }
+
   /// Pages added so far (cover + frames).
-  int get pageCount => _pages.length;
+  int get pageCount => _eager ? _eagerAdded : _pages.length;
 
   /// True when the document carries pages and a logo to draw (the cover
   /// and every frame page draw the tile from one shared XObject).
   bool get _hasLogo => _logoDeflate != null && _pages.isNotEmpty;
 
-  /// Serialises the document. Pure byte concatenation plus the xref
-  /// table — no pixel work happens here.
-  Uint8List build() {
-    // Object numbering: 1 Catalog, 2 Pages, 3 Helvetica, 4 Helvetica-Bold,
-    // then the shared logo XObject (when present), then per page i:
-    // Page, Contents, Image (3 objects each).
+  /// Object numbering: 1 Catalog, 2 Pages, 3 Helvetica, 4 Helvetica-Bold,
+  /// then the shared logo XObject (when [hasLogo]), then per page:
+  /// Page, Contents, Image (3 objects each). Returns the logo object
+  /// number (null when no logo) and one (page, content, image) triple
+  /// per page.
+  static (int?, List<(int, int, int)>) _numbering(
+    int pageCount, {
+    required bool hasLogo,
+  }) {
     var nextObj = 5;
-    final int? logoObj = _hasLogo ? nextObj++ : null;
-    final pageObjs = <(int page, int content, int image)>[];
-    for (var i = 0; i < _pages.length; i++) {
+    final int? logoObj = hasLogo ? nextObj++ : null;
+    final pageObjs = <(int, int, int)>[];
+    for (var i = 0; i < pageCount; i++) {
       pageObjs.add((nextObj, nextObj + 1, nextObj + 2));
       nextObj += 3;
     }
+    return (logoObj, pageObjs);
+  }
 
-    final out = BytesBuilder();
-    final offsets = <int>[];
-    void addObject(List<int> body) {
-      offsets.add(out.length);
-      out.add(_ascii('${offsets.length} 0 obj\n'));
-      out.add(body);
-      out.add(_ascii('\nendobj\n'));
-    }
+  /// Appends one object to [out], recording its byte offset. The
+  /// object number is the count of objects already written + 1, so
+  /// callers must append in object-number order.
+  static void _addObject(
+    BytesBuilder out,
+    List<int> offsets,
+    List<int> body,
+  ) {
+    offsets.add(out.length);
+    out.add(_ascii('${offsets.length} 0 obj\n'));
+    out.add(body);
+    out.add(_ascii('\nendobj\n'));
+  }
 
+  /// Writes the header and the front matter (Catalog, Pages with the
+  /// full Kids list + Count, both fonts, the shared logo XObject) for
+  /// a document of [pageCount] pages. The Kids list needs every page's
+  /// object number, which is why eager mode needs [totalPages] up
+  /// front — the front matter is written before the first page.
+  void _writeFrontMatter(
+    BytesBuilder out,
+    List<int> offsets,
+    int pageCount,
+    int? logoObj,
+    List<(int, int, int)> pageObjs,
+  ) {
     out.add(_ascii('%PDF-1.4\n%\xe2\xe3\xcf\xd3\n'));
-    final n = _pages.length;
     final kids =
         [for (final objs in pageObjs) '${objs.$1} 0 R'].join(' ');
-    addObject(_ascii('<< /Type /Catalog /Pages 2 0 R >>'));
-    addObject(_ascii('<< /Type /Pages /Kids [$kids] /Count $n >>'));
-    addObject(
+    _addObject(out, offsets, _ascii('<< /Type /Catalog /Pages 2 0 R >>'));
+    _addObject(
+      out,
+      offsets,
+      _ascii('<< /Type /Pages /Kids [$kids] /Count $pageCount >>'),
+    );
+    _addObject(
+      out,
+      offsets,
       _ascii(
         '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica '
         '/Encoding /WinAnsiEncoding >>',
       ),
     );
-    addObject(
+    _addObject(
+      out,
+      offsets,
       _ascii(
         '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold '
         '/Encoding /WinAnsiEncoding >>',
@@ -178,7 +261,9 @@ class RawPdfWriter {
     );
     if (logoObj != null) {
       final deflate = _logoDeflate!;
-      addObject(
+      _addObject(
+        out,
+        offsets,
         (BytesBuilder()
               ..add(
                 _ascii(
@@ -195,58 +280,77 @@ class RawPdfWriter {
             .toBytes(),
       );
     }
-    for (var i = 0; i < n; i++) {
-      final page = _pages[i];
-      final (_, contentObj, imageObj) = pageObjs[i];
-      const mediaBox = '[0 0 $landscapeWidth $landscapeHeight]';
-      final xobjects = logoObj == null
-          ? '/Im0 $imageObj 0 R'
-          : '/Im0 $imageObj 0 R /Im1 $logoObj 0 R';
-      addObject(
-        _ascii(
-          '<< /Type /Page /Parent 2 0 R '
-          '/MediaBox $mediaBox '
-          '/Resources << /Font << /F1 3 0 R /F2 4 0 R >> '
-          '/XObject << $xobjects >> '
-          '/ProcSet [/PDF /Text /ImageB /ImageC] >> '
-          '/Contents $contentObj 0 R >>',
-        ),
-      );
-      final compressed = Uint8List.fromList(
-        const ZLibEncoder().encode(
-          page.contentOperators(hasLogo: logoObj != null),
-        ),
-      );
-      addObject(
-        (BytesBuilder()
-              ..add(
-                _ascii(
-                  '<< /Length ${compressed.length} /Filter /FlateDecode >>\n'
-                  'stream\n',
-                ),
-              )
-              ..add(compressed)
-              ..add(_ascii('\nendstream')))
-            .toBytes(),
-      );
-      addObject(
-        (BytesBuilder()
-              ..add(
-                _ascii(
-                  '<< /Type /XObject /Subtype /Image '
-                  '/Width ${page.imageWidth} /Height ${page.imageHeight} '
-                  '/BitsPerComponent 1 /ColorSpace /DeviceGray '
-                  '/Filter /FlateDecode '
-                  '/Length ${page.imageDeflate.length} >>\n'
-                  'stream\n',
-                ),
-              )
-              ..add(page.imageDeflate)
-              ..add(_ascii('\nendstream')))
-            .toBytes(),
-      );
-    }
+  }
 
+  /// Writes one page's three objects (Page dict, Flate content stream,
+  /// image XObject) for [page] with object numbers [objs]; [logoObj]
+  /// is the shared logo XObject number (null when no logo).
+  void _writePage(
+    BytesBuilder out,
+    List<int> offsets,
+    _RawPdfPage page,
+    (int, int, int) objs,
+    int? logoObj,
+  ) {
+    final (_, contentObj, imageObj) = objs;
+    const mediaBox = '[0 0 $landscapeWidth $landscapeHeight]';
+    final xobjects = logoObj == null
+        ? '/Im0 $imageObj 0 R'
+        : '/Im0 $imageObj 0 R /Im1 $logoObj 0 R';
+    _addObject(
+      out,
+      offsets,
+      _ascii(
+        '<< /Type /Page /Parent 2 0 R '
+        '/MediaBox $mediaBox '
+        '/Resources << /Font << /F1 3 0 R /F2 4 0 R >> '
+        '/XObject << $xobjects >> '
+        '/ProcSet [/PDF /Text /ImageB /ImageC] >> '
+        '/Contents $contentObj 0 R >>',
+      ),
+    );
+    final compressed = Uint8List.fromList(
+      const ZLibEncoder().encode(
+        page.contentOperators(hasLogo: logoObj != null),
+      ),
+    );
+    _addObject(
+      out,
+      offsets,
+      (BytesBuilder()
+            ..add(
+              _ascii(
+                '<< /Length ${compressed.length} /Filter /FlateDecode >>\n'
+                'stream\n',
+              ),
+            )
+            ..add(compressed)
+            ..add(_ascii('\nendstream')))
+          .toBytes(),
+    );
+    _addObject(
+      out,
+      offsets,
+      (BytesBuilder()
+            ..add(
+              _ascii(
+                '<< /Type /XObject /Subtype /Image '
+                '/Width ${page.imageWidth} /Height ${page.imageHeight} '
+                '/BitsPerComponent 1 /ColorSpace /DeviceGray '
+                '/Filter /FlateDecode '
+                '/Length ${page.imageDeflate.length} >>\n'
+                'stream\n',
+              ),
+            )
+            ..add(page.imageDeflate)
+            ..add(_ascii('\nendstream')))
+          .toBytes(),
+    );
+  }
+
+  /// Appends the xref table + trailer for the objects recorded in
+  /// [offsets] to [out]. Pure byte concatenation — no pixel work.
+  static void _writeXref(BytesBuilder out, List<int> offsets) {
     final xrefAt = out.length;
     final total = offsets.length + 1;
     final xref = StringBuffer()
@@ -263,6 +367,58 @@ class RawPdfWriter {
       ..writeln(xrefAt)
       ..writeln('%%EOF');
     out.add(_ascii(xref.toString()));
+  }
+
+  /// Starts eager serialisation: computes the object numbering for
+  /// [totalPages] pages and writes the front matter. Idempotent —
+  /// the first added page triggers it, [build] triggers it for the
+  /// zero-pages edge.
+  void _beginEager() {
+    if (_out != null) return;
+    final n = totalPages!;
+    final (logoObj, pageObjs) = _numbering(
+      n,
+      hasLogo: _logoDeflate != null,
+    );
+    _logoObj = logoObj;
+    _pageObjs = pageObjs;
+    _out = BytesBuilder();
+    _offsets = <int>[];
+    _writeFrontMatter(_out!, _offsets!, n, logoObj, pageObjs);
+  }
+
+  /// Serialises the document. Pure byte concatenation plus the xref
+  /// table — no pixel work happens here.
+  ///
+  /// In eager mode the pages were already serialised by [addCoverPage]/
+  /// [addFramePage]; this only appends the xref + trailer (and throws
+  /// [StateError] when fewer than [totalPages] pages were added).
+  /// In lazy mode it serialises everything from the collected pages.
+  Uint8List build() {
+    if (_eager) {
+      _beginEager();
+      if (_eagerAdded != totalPages) {
+        throw StateError(
+          'RawPdfWriter: eager mode declared $totalPages pages but '
+          'only $_eagerAdded were added',
+        );
+      }
+      final out = _out!;
+      _writeXref(out, _offsets!);
+      return out.toBytes();
+    }
+    final n = _pages.length;
+    final (logoObj, pageObjs) = _numbering(
+      n,
+      hasLogo: _hasLogo,
+    );
+    final out = BytesBuilder();
+    final offsets = <int>[];
+    _writeFrontMatter(out, offsets, n, logoObj, pageObjs);
+    for (var i = 0; i < n; i++) {
+      _writePage(out, offsets, _pages[i], pageObjs[i], logoObj);
+    }
+    _writeXref(out, offsets);
     return out.toBytes();
   }
 }

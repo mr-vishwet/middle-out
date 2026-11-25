@@ -55,16 +55,37 @@ class BuildCancelledException implements Exception {
 class PdfDocument {
   /// Builds the PDF bytes for [result] (the encode of [fileName]).
   ///
-  /// Two phases, reported through [onProgress] — fraction 0..1 of the
-  /// PDF build plus a human-readable label:
-  /// * Phase 1, "Creating images… N of M": builds every frame image
-  ///   (grid + deflate), yielding to the event loop after every frame so
-  ///   the UI can repaint the progress bar and respond to taps (Cancel)
-  ///   during a long build. Without the yields the whole build blocks
-  ///   the UI thread and the bar sits pinned at its last value for
-  ///   minutes on large files.
-  /// * Phase 2, "Binding into PDF…": assembles the document via
-  ///   [RawPdfWriter] (cover + frame pages) and serialises it.
+  /// One fused pass, reported through [onProgress] — fraction 0..1 of
+  /// the PDF build plus a human-readable label. The progress sequence
+  /// is unchanged from the old two-phase build, so the UI and its
+  /// tests see the same callbacks:
+  /// * Per frame, "Creating images… N of M": the frame is packed
+  ///   row-by-row ([CodeGrid.packFrameGrid] — no w x h matrix is ever
+  ///   built), deflated ([PngEncode.deflatePacked]) and bound into the
+  ///   document immediately ([RawPdfWriter] in eager mode, given the
+  ///   total page count up front), then its buffers are dropped. The
+  ///   loop yields to the event loop after every frame so the UI can
+  ///   repaint the progress bar and respond to taps (Cancel) during a
+  ///   long build. Without the yields the whole build blocks the UI
+  ///   thread and the bar sits pinned at its last value for minutes on
+  ///   large files.
+  /// * "Binding into PDF…" at 0.95 and at 1.0: the writer only appends
+  ///   the xref table + trailer here — every page is already bound.
+  ///
+  /// Memory: the old build held ALL frame images (phase 1) AND a
+  /// second copy inside the writer's page list before binding, so a
+  /// big document peaked at ~3x the PDF size plus one full grid
+  /// matrix per frame. This build holds the output-so-far (one copy
+  /// of the PDF, unavoidable — it is returned as bytes) plus one
+  /// page's packed image + deflate buffers transiently. The honest
+  /// ceiling is therefore the PDF itself: in-browser encoding is
+  /// bounded by RAM for (input + compressed stream + PDF), realistically
+  /// a few hundred MB of PDF on a typical device. Beyond that the
+  /// route is the streaming/native encoder, which frames off disk —
+  /// and, for a true multi-GB PDF, a file sink plumbed through the
+  /// controller (the writer already emits pages incrementally; only
+  /// the sink + the returned-bytes API stand between it and disk).
+  /// Nothing here pretends a 50 GB PDF fits in a browser tab.
   ///
   /// When [shouldCancel] returns true the build stops promptly by
   /// throwing [BuildCancelledException]. Neither callback changes the
@@ -82,23 +103,45 @@ class PdfDocument {
   }) async {
     final frames = result.frames;
 
-    // --- Phase 1: build every frame image (grid + deflate) ---
-    final images = <_FrameImage>[];
+    // The logo tile is deflated once per document; the writer shares one
+    // XObject across all frame pages.
+    final logoDeflate = Uint8List.fromList(
+      const ZLibEncoder().encode(LogoTile.rgb, level: 6),
+    );
+    // Eager writer: the page count is known up front (cover + one
+    // page per frame), so each page is serialised as it is built and
+    // its image bytes are dropped — no phase-1 image list.
+    final writer = RawPdfWriter(
+      logoDeflate: logoDeflate,
+      logoWidth: LogoTile.size,
+      logoHeight: LogoTile.size,
+      totalPages: 1 + frames.length,
+    );
+
+    // Cover page: landscape like the code pages, branding + details +
+    // the scannable QR, light in both variants.
+    final (qrW, qrH, qrDeflate) = _coverQrDeflate();
+    writer.addCoverPage(
+      detailLines: _detailLines(result, fileName, dark),
+      imageWidth: qrW,
+      imageHeight: qrH,
+      imageDeflate: qrDeflate,
+    );
+
     for (var i = 0; i < frames.length; i++) {
       final raw = frames[i].toBytes();
-      final grid = CodeGrid.buildFrameGrid(raw, barcode: result.barcode);
-      final deflate = PngEncode.deflate1Bit(
-        grid,
-        grid[0].length,
-        grid.length,
+      final packed = CodeGrid.packFrameGrid(raw, barcode: result.barcode);
+      final deflate = PngEncode.deflatePacked(
+        packed.bytes,
+        packed.width,
+        packed.height,
         dark: dark,
       );
-      images.add(
-        _FrameImage(
-          width: grid[0].length,
-          height: grid.length,
-          deflate: deflate,
-        ),
+      writer.addFramePage(
+        imageWidth: packed.width,
+        imageHeight: packed.height,
+        imageDeflate: deflate,
+        dark: dark,
       );
       onProgress?.call(
         0.9 * (i + 1) / frames.length,
@@ -113,42 +156,13 @@ class PdfDocument {
       await Future<void>.delayed(Duration.zero);
     }
 
-    // --- Phase 2: bind the document ---
+    // Binding: every page is already serialised; only the xref table
+    // + trailer remain.
     onProgress?.call(0.95, 'Binding into PDF…');
     if (shouldCancel?.call() == true) {
       throw const BuildCancelledException();
     }
     await Future<void>.delayed(Duration.zero);
-
-    // The logo tile is deflated once per document; the writer shares one
-    // XObject across all frame pages.
-    final logoDeflate = Uint8List.fromList(
-      const ZLibEncoder().encode(LogoTile.rgb, level: 6),
-    );
-    final writer = RawPdfWriter(
-      logoDeflate: logoDeflate,
-      logoWidth: LogoTile.size,
-      logoHeight: LogoTile.size,
-    );
-
-    // Cover page: landscape like the code pages, branding + details +
-    // the scannable QR, light in both variants.
-    final (qrW, qrH, qrDeflate) = _coverQrDeflate();
-    writer.addCoverPage(
-      detailLines: _detailLines(result, fileName, dark),
-      imageWidth: qrW,
-      imageHeight: qrH,
-      imageDeflate: qrDeflate,
-    );
-
-    for (final image in images) {
-      writer.addFramePage(
-        imageWidth: image.width,
-        imageHeight: image.height,
-        imageDeflate: image.deflate,
-        dark: dark,
-      );
-    }
 
     final bytes = writer.build();
     onProgress?.call(1, 'Binding into PDF…');
@@ -197,23 +211,4 @@ class PdfDocument {
     }
     return (width, height, PngEncode.deflate1Bit(rows, width, height));
   }
-}
-
-/// One built frame image, ready to bind into the PDF.
-class _FrameImage {
-  /// Creates a frame image.
-  const _FrameImage({
-    required this.width,
-    required this.height,
-    required this.deflate,
-  });
-
-  /// Image width in pixels (grid modules).
-  final int width;
-
-  /// Image height in pixels (grid modules).
-  final int height;
-
-  /// Zlib-compressed packed 1-bit pixels (predictor 1).
-  final Uint8List deflate;
 }

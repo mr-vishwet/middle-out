@@ -318,4 +318,117 @@ void main() {
       );
     });
   });
+
+  group('RawPdfWriter eager mode (streaming binding)', () {
+    Uint8List buildDoc({required bool eager}) {
+      final writer = eager
+          ? RawPdfWriter(
+              logoDeflate: tinyLogoDeflate(),
+              totalPages: 3,
+            )
+          : RawPdfWriter(logoDeflate: tinyLogoDeflate());
+      writer
+        ..addCoverPage(
+          detailLines: const ['File: demo.bin', 'Pages: 3'],
+          imageWidth: 8,
+          imageHeight: 8,
+          imageDeflate: tinyDeflate(),
+        )
+        ..addFramePage(
+          imageWidth: 45,
+          imageHeight: 32,
+          imageDeflate: tinyDeflate(),
+        )
+        ..addFramePage(
+          imageWidth: 45,
+          imageHeight: 32,
+          imageDeflate: tinyDeflate(),
+          dark: true,
+        );
+      return writer.build();
+    }
+
+    test('eager bytes are identical to lazy bytes', () {
+      // The streaming binding must not change a single byte: same
+      // front matter, same page objects, same xref.
+      expect(buildDoc(eager: true), buildDoc(eager: false));
+      expect(buildDoc(eager: true).length, buildDoc(eager: false).length);
+    });
+
+    test('eager writer without a logo matches lazy too', () {
+      Uint8List buildNoLogo({required bool eager}) {
+        final writer = eager
+            ? RawPdfWriter(totalPages: 1)
+            : RawPdfWriter();
+        writer.addFramePage(
+          imageWidth: 45,
+          imageHeight: 32,
+          imageDeflate: tinyDeflate(),
+        );
+        return writer.build();
+      }
+
+      expect(buildNoLogo(eager: true), buildNoLogo(eager: false));
+    });
+
+    test('eager writer reports pageCount as pages are added', () {
+      final writer = RawPdfWriter(
+        logoDeflate: tinyLogoDeflate(),
+        totalPages: 2,
+      );
+      expect(writer.pageCount, 0);
+      writer.addCoverPage(
+        detailLines: const ['File: demo.bin'],
+        imageWidth: 8,
+        imageHeight: 8,
+        imageDeflate: tinyDeflate(),
+      );
+      expect(writer.pageCount, 1);
+      writer.addFramePage(
+        imageWidth: 45,
+        imageHeight: 32,
+        imageDeflate: tinyDeflate(),
+      );
+      expect(writer.pageCount, 2);
+      expect(writer.build().length, greaterThan(0));
+    });
+
+    test('eager writer throws when fewer pages are added than declared',
+        () {
+      final writer = RawPdfWriter(
+        logoDeflate: tinyLogoDeflate(),
+        totalPages: 2,
+      )..addCoverPage(
+          detailLines: const ['File: demo.bin'],
+          imageWidth: 8,
+          imageHeight: 8,
+          imageDeflate: tinyDeflate(),
+        );
+      expect(
+        () => writer.build(),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('eager writer throws when more pages are added than declared',
+        () {
+      final writer = RawPdfWriter(
+        logoDeflate: tinyLogoDeflate(),
+        totalPages: 1,
+      )..addCoverPage(
+          detailLines: const ['File: demo.bin'],
+          imageWidth: 8,
+          imageHeight: 8,
+          imageDeflate: tinyDeflate(),
+        );
+      expect(
+        () => writer.addFramePage(
+          imageWidth: 45,
+          imageHeight: 32,
+          imageDeflate: tinyDeflate(),
+        ),
+        throwsA(isA<StateError>()),
+      );
+    });
+  });
 }

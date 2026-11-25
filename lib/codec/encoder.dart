@@ -66,7 +66,7 @@ typedef EncodeProgress = void Function(double fraction, String label);
 /// Encodes a file into Middle Out frames.
 ///
 /// Pipeline: SHA-256 -> zlib-9 compress -> (optional ChaCha20 encrypt) ->
-/// split into at most [kMaxDataPages] EQUAL chunks (the last zero-padded
+/// split into [dataPageCount] EQUAL chunks (the last zero-padded
 /// to the chunk size) -> group into 6 DATA + up to 2 XOR-parity.
 ///
 /// [encode] works on bytes already in memory, synchronously.
@@ -80,18 +80,76 @@ typedef EncodeProgress = void Function(double fraction, String label);
 /// encode uses the same framing, headers and parity layout as an
 /// in-memory one — only the chunking and the equal-split flag differ.
 class Encoder {
+  /// One page-count unit of compressed bytes (5 MiB): the adaptive rule
+  /// below counts `compressedSize` in these units, then takes the
+  /// square root. The unit is part of the rule, not a per-page target —
+  /// a 20 MB file lands on 2 pages of ~10.5 MB each, a 1 GB file on 14
+  /// pages of ~77 MB, and the count only reaches [kMaxDataPages] once
+  /// the compressed stream passes ~4.3 GB.
+  static const int _pageCountUnit = 5 * 1024 * 1024;
+
+  /// Adaptive DATA-page count for a compressed (+encrypted) stream of
+  /// [compressedSize] bytes — the single home of the page-count rule
+  /// (the estimate screen calls this; it lives nowhere else).
+  ///
+  /// The count grows SUB-LINEARLY: `N = round(sqrt(S / 5 MiB))`,
+  /// clamped to `[1, kMaxDataPages]`. Page size is the OUTPUT
+  /// (`ceil(S / N)`), never an input — a fixed per-page target would
+  /// need 1,000 pages for a 10 GB file. Measured counts (incompressible
+  /// inputs, so S is the file size plus zlib's few stored-block bytes):
+  ///
+  /// | compressed size | pages | per-page payload |
+  /// | 20 MiB | 2 | ~10.5 MB |
+  /// | 1 GiB | 14 | ~76.7 MB |
+  /// | 10 GiB | 30 (cap) | ~357.9 MB |
+  /// | 50 GiB | 30 (cap) | ~1.79 GB |
+  ///
+  /// The count reaches the 30-page cap at S = 871 units (~4.25 GiB).
+  /// `round`, not `ceil`: zlib ADDS bytes to incompressible data, so a
+  /// 20 MiB file compresses to a hair over 20,971,520 bytes — `sqrt`
+  /// lands a hair over 2.0, and `ceil` would wrongly give 3 pages.
+  /// Rounding keeps 2 pages for every S in [15 MiB, 35 MiB), with the
+  /// next page only at S >= 35 MiB.
+  ///
+  /// Exact integer arithmetic (Newton square root + integer rounding),
+  /// so the Dart side and the Python reference agree bit-for-bit with
+  /// no float edge cases: `sqrt(n)` is never exactly `k + 0.5`, and
+  /// the rounding comparison below has no ties for non-square `n`.
+  static int dataPageCount(int compressedSize) {
+    if (compressedSize <= 0) return 1;
+    final n = compressedSize ~/ _pageCountUnit;
+    final r = _isqrt(n);
+    // Nearest integer to sqrt(n): round up iff n is closer to (r+1)^2.
+    final rounded = (n - r * r) > ((r + 1) * (r + 1) - n) ? r + 1 : r;
+    return rounded.clamp(1, kMaxDataPages);
+  }
+
+  /// Floor of the square root of [n] (Newton iteration, exact integer
+  /// arithmetic — no doubles, so no float edge cases at the boundary).
+  static int _isqrt(int n) {
+    if (n <= 0) return 0;
+    var x = n;
+    var y = (x + 1) ~/ 2;
+    while (y < x) {
+      x = y;
+      y = (x + n ~/ x) ~/ 2;
+    }
+    return x;
+  }
+
   /// Encodes [data]. Pass [passphrase] to encrypt (default ON in the UI);
   /// pass null for a plain encode whose payload is human-readable.
   ///
-  /// [maxPayload] is the sizing unit for the equal split: the stream is
-  /// divided into `min(kMaxDataPages, ceil(stream / maxPayload))` equal
-  /// chunks, so a chunk can be larger than [maxPayload] when the stream
-  /// needs more than [kMaxDataPages] chunks at that unit. Streaming
-  /// encodes keep [maxPayload] as a hard chunk size.
+  /// [maxPayload] overrides the adaptive count with the legacy rule:
+  /// the stream is divided into `clamp(ceil(stream / maxPayload), 1,
+  /// kMaxDataPages)` equal chunks. Pass null (the default) for the
+  /// adaptive [dataPageCount] rule. Tests use small explicit values to
+  /// force multi-page shapes cheaply; production callers leave it null.
+  /// Streaming encodes keep [maxPayload] as a hard chunk size.
   static EncodeResult encode(
     Uint8List data, {
     String? passphrase,
-    int maxPayload = kDefaultMaxPayload,
+    int? maxPayload,
     bool barcode = false,
   }) {
     final sha = _hash(data);
@@ -118,7 +176,7 @@ class Encoder {
   static Future<EncodeResult> encodeAsync(
     Uint8List data, {
     String? passphrase,
-    int maxPayload = kDefaultMaxPayload,
+    int? maxPayload,
     bool barcode = false,
     EncodeProgress? onProgress,
   }) async {
@@ -183,17 +241,18 @@ class Encoder {
     );
   }
 
-  /// Equal-split chunking: the stream is divided into at most
-  /// [kMaxDataPages] equal chunks of [chunkSize] bytes
-  /// (`ceil(stream.length / count)`), so every code page is dense no
-  /// matter the file size. The LAST chunk is zero-padded to [chunkSize]
-  /// so all data frames (and the parity built from them) share one
-  /// width; the decoder trims the reassembled stream to
-  /// `compressedSize` before decrypt/decompress, stripping the padding.
+  /// Equal-split chunking: the stream is divided into [dataPageCount]
+  /// equal chunks of [chunkSize] bytes (`ceil(stream.length / count)`),
+  /// so every code page is dense no matter the file size. The LAST chunk
+  /// is zero-padded to [chunkSize] so all data frames (and the parity
+  /// built from them) share one width; the decoder trims the reassembled
+  /// stream to `compressedSize` before decrypt/decompress, stripping
+  /// the padding.
   ///
-  /// [maxPayload] is the sizing unit: `count =
-  /// min(kMaxDataPages, ceil(stream.length / maxPayload))`, clamped to
-  /// at least 1. The count is then re-derived from the chunk size
+  /// [maxPayload] overrides the count with the legacy rule: `count =
+  /// clamp(ceil(stream.length / maxPayload), 1, kMaxDataPages)`. Pass
+  /// null (the default) for the adaptive [dataPageCount] rule. The
+  /// count is then re-derived from the chunk size
   /// (`ceil(stream.length / chunkSize)`) so the last chunk is the only
   /// short one — without that, a tiny stream with a tiny unit could
   /// yield a short MIDDLE chunk (or an empty one), which the decoder
@@ -203,10 +262,12 @@ class Encoder {
   ///
   /// An empty stream yields one empty chunk (one empty data frame, no
   /// parity — [buildFrames] skips empty parities).
-  static List<Uint8List> _chunk(Uint8List stream, int maxPayload) {
-    final unit = maxPayload < 1 ? 1 : maxPayload;
-    var count = ((stream.length + unit - 1) ~/ unit)
-        .clamp(1, kMaxDataPages);
+  static List<Uint8List> _chunk(Uint8List stream, int? maxPayload) {
+    var count = dataPageCount(stream.length);
+    if (maxPayload != null) {
+      final unit = maxPayload < 1 ? 1 : maxPayload;
+      count = ((stream.length + unit - 1) ~/ unit).clamp(1, kMaxDataPages);
+    }
     final chunkSize = (stream.length + count - 1) ~/ count;
     if (chunkSize > 0) {
       // Re-derive the count from the chunk size (see the doc above).

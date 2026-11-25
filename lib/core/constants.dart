@@ -78,7 +78,11 @@ const int kFlagBarcode = 0x04;
 /// Set on every frame of an equal-split encode: the compressed stream was
 /// divided into [kMaxDataPages] or fewer EQUAL chunks (the last chunk
 /// zero-padded to the chunk size) instead of fixed [kDefaultMaxPayload]
-/// chunks. The decoder derives the chunk size from the header
+/// chunks. The page COUNT is adaptive — `Encoder.dataPageCount` grows it
+/// sub-linearly with the compressed size (2 pages for a 20 MB file, 14
+/// for 1 GB, 30 at ~4.3 GB and above) — so a fixed per-page size is
+/// never the rule: the page size is the output (compressedSize / count),
+/// not an input. The decoder derives the chunk size from the header
 /// (`ceil(compressedSize / totalDataFrames)`) and trims the reassembled
 /// stream to `compressedSize` before decrypt/decompress. Old frames lack
 /// this flag and keep the fixed-chunk derivation, so old PDFs still decode.
@@ -109,20 +113,26 @@ const int kParityASlot = 6;
 /// Group slot of the parity frame protecting [kParityBTrio].
 const int kParityBSlot = 7;
 
-/// Sizing unit for equal-split encodes (64 KiB) and the fixed chunk
-/// size for streaming encodes. The in-memory encoder divides the
-/// compressed stream into `min(kMaxDataPages, ceil(stream / unit))`
-/// equal chunks, so a frame holds up to ~50 MB on a 1 GB input — the
-/// grid cap ([CodeGrid.maxHeight]) sizes for that, not for 64 KiB.
+/// Fixed chunk size for streaming encodes (64 KiB). The in-memory
+/// encoder no longer sizes from this: it equal-splits by the adaptive
+/// page count (`Encoder.dataPageCount` in encoder.dart), so a frame holds up to ~10.5 MB
+/// on a 20 MB input, ~77 MB on a 1 GB input and ~1.7 GB on a 50 GB input
+/// — the grid cap ([CodeGrid.maxHeight]) sizes for that, not for 64 KiB.
+/// Streaming encodes (which do not know the total upfront) keep fixed
+/// 64 KiB chunks; callers that pass an explicit `maxPayload` to
+/// `Encoder.encode` get the legacy `ceil(stream / maxPayload)` count,
+/// clamped to [kMaxDataPages].
 const int kDefaultMaxPayload = 65536;
 
 /// Maximum DATA frames (code pages) in an equal-split encode: the
 /// compressed stream is divided into at most this many equal chunks, so
-/// every code page is dense no matter the file size. A 1-data encode
-/// still yields 1 data frame; streaming encodes (which do not know the
+/// every code page is dense no matter the file size. The count comes
+/// from `Encoder.dataPageCount` (sub-linear in the compressed size) and
+/// only reaches this cap at ~4.3 GB of compressed data; a 1-data encode
+/// still yields 1 data frame. Streaming encodes (which do not know the
 /// total upfront) use fixed [kDefaultMaxPayload] chunks instead and are
 /// not bound by this.
-const int kMaxDataPages = 20;
+const int kMaxDataPages = 30;
 
 /// Maximum frames in one encode.
 ///
@@ -131,7 +141,7 @@ const int kMaxDataPages = 20;
 /// cap can be raised later without another format change. It binds the
 /// streaming path (fixed 64 KiB chunks: a 67 MB mp4 needs 1,125 frames)
 /// and hand-built frame sets; the in-memory equal-split path never comes
-/// close (at most [kMaxDataPages] data + 8 parity = 28 frames). Beyond
+/// close (at most [kMaxDataPages] data + 10 parity = 40 frames). Beyond
 /// 4,096 frames the PDF itself is unusable, and the estimate screen
 /// warns before encoding starts.
 const int kMaxFrames = 4096;

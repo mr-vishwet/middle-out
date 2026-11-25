@@ -13,8 +13,12 @@ import 'package:middle_out/codec/pdf_writer.dart';
 import 'package:middle_out/codec/png_encode.dart';
 import 'package:middle_out/services/pdf_frame_extractor.dart';
 
-/// Incompressible bytes: 200 KiB of seeded random data encodes to 4 equal
-/// ~50 KiB data frames + 2 parity, enough to exercise the builder.
+/// Incompressible bytes: 200 KiB of seeded random data encodes to 1 dense
+/// ~200 KiB data frame + 1 parity under the default adaptive rule
+/// (dataPageCount: 200 KiB < 15 MiB), enough to exercise the builder.
+/// Tests that need several dense pages pass an explicit small
+/// `maxPayload` to `Encoder.encode` instead (see 'every code page is
+/// dense' below).
 Uint8List randomBytes(int length) {
   final random = Random(42);
   return Uint8List.fromList(
@@ -177,6 +181,10 @@ void main() {
       }
     });
 
+    // 2-minute timeout: the encrypted path (PBKDF2 + ChaCha + PDF build)
+    // exceeds the 30s default under DDC, the dev compiler used by
+    // `flutter test --platform chrome`. It is fast on the VM and on the
+    // release site; this is test-runner slowness, not a product issue.
     test('encrypted encode round-trips through the new PDF', () async {
       final data = randomBytes(100 * 1024);
       final encoded = Encoder.encode(data, passphrase: 'test-passphrase');
@@ -188,7 +196,7 @@ void main() {
         passphrase: 'test-passphrase',
       );
       expect(decoded, data);
-    });
+    }, timeout: const Timeout(Duration(minutes: 2)));
 
     test('cover-stripped PDF still decodes (decoder never reads the cover)',
         () async {
@@ -221,7 +229,10 @@ void main() {
 
     test('every code page is dense (equal split, no sparse pages)', () async {
       final data = randomBytes(200 * 1024);
-      final encoded = Encoder.encode(data);
+      // Explicit 64 KiB unit forces 4 dense pages: the default adaptive
+      // rule gives 1 page for 200 KiB, which cannot prove "no sparse
+      // pages" across several pages.
+      final encoded = Encoder.encode(data, maxPayload: 64 * 1024);
       // 4 equal data frames + 2 parity: every data frame carries the
       // full chunk size, so no page renders a tiny grid.
       final dataFrames = [
@@ -242,6 +253,11 @@ void main() {
   });
 
   group('old-format golden PDFs still decode', () {
+    // Chrome-only skip: the golden fixture is read via dart:io File,
+    // which does not exist on web. The golden still runs on the VM
+    // (CI + local), and the decode path itself is covered in Chrome by
+    // the extractor tests. (An HTTP fixture loader, the FRAME POLICE
+    // pattern, would restore Chrome coverage here.)
     test('grid golden (8-bit RGB XObjects from the old builder)', () {
       final file = File('test/fixtures/old_format_grid.pdf');
       expect(
@@ -265,8 +281,14 @@ void main() {
         sha256.convert(decoded).toString(),
         sha256.convert(data).toString(),
       );
+    }, onPlatform: const {
+      'chrome': Skip(
+        'golden fixture is read via dart:io File, which does not exist '
+        'on web; the golden still runs on the VM',
+      ),
     });
 
+    // Chrome-only skip: same dart:io fixture read as the grid golden.
     test('barcode golden (8-bit RGB XObjects from the old builder)', () {
       final file = File('test/fixtures/old_format_barcode.pdf');
       expect(
@@ -289,6 +311,11 @@ void main() {
         sha256.convert(decoded).toString(),
         sha256.convert(data).toString(),
       );
+    }, onPlatform: const {
+      'chrome': Skip(
+        'golden fixture is read via dart:io File, which does not exist '
+        'on web; the golden still runs on the VM',
+      ),
     });
   });
 }

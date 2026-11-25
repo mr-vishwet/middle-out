@@ -19,6 +19,11 @@ import 'frame.dart';
 ///   verbatim as a DeviceGray image XObject. No PNG decode/re-encode
 ///   step ever runs on them, which is what makes the PDF build fast
 ///   (see [RawPdfWriter]).
+/// * [deflatePacked] — the same, but from already-packed 1-bit rows
+///   ([CodeGrid.packGrid]): the streaming path never materialises the
+///   w x h module matrix, so a dense page costs O(image bytes), not
+///   O(cells x bool). [PdfDocument.build] uses this; [deflate1Bit]
+///   stays for the cover QR, tests and tooling.
 class PngEncode {
   /// Encodes a [width] x [height] 1-bit image. [rows] is one byte per
   /// module (0 = white, 1 = black); each row must be [width] long.
@@ -63,21 +68,41 @@ class PngEncode {
     int height, {
     bool dark = false,
   }) {
-    final packed = _packAndInvert(rows, width, height, dark: dark);
+    final packed = _packRows(rows, width, height);
+    _invertAndMask(packed, width, height, dark: dark);
     return Uint8List.fromList(const ZLibEncoder().encode(packed, level: 6));
   }
 
-  /// Packs [rows] of 0/1 modules into bytes, MSB first, then inverts to
-  /// DeviceGray polarity (0 = black, 1 = white). Pad bits past the row
-  /// width are zero. No filter bytes — callers add them if needed.
-  /// With [dark] the inversion is skipped, so the packed bits are the
-  /// module bits themselves: black modules render white, white black.
-  static Uint8List _packAndInvert(
-    List<Uint8List> rows,
+  /// Packs already-packed 1-bit rows into zlib-compressed bytes for a
+  /// PDF image XObject (predictor 1: packed bits, no filter bytes).
+  /// [packed] is [height] rows of `(width + 7) ~/ 8` bytes, MSB first,
+  /// 1 = black module — exactly what [CodeGrid.packGrid] returns.
+  /// The input is copied, not mutated: the caller's packed bytes stay
+  /// in module polarity.
+  ///
+  /// Level 6, not 9, and [dark] invert the polarity for dark code
+  /// pages, exactly as in [deflate1Bit] — the two produce identical
+  /// bytes for the same grid (proven by the equivalence test in
+  /// `code_grid_test.dart`).
+  static Uint8List deflatePacked(
+    Uint8List packed,
     int width,
     int height, {
     bool dark = false,
   }) {
+    final raw = Uint8List.fromList(packed);
+    _invertAndMask(raw, width, height, dark: dark);
+    return Uint8List.fromList(const ZLibEncoder().encode(raw, level: 6));
+  }
+
+  /// Packs [rows] of 0/1 modules into bytes, MSB first. Pad bits past
+  /// the row width are zero. No filter bytes — callers add them if
+  /// needed. No inversion — see [_invertAndMask].
+  static Uint8List _packRows(
+    List<Uint8List> rows,
+    int width,
+    int height,
+  ) {
     if (rows.length != height) {
       throw ArgumentError('rows.length (${rows.length}) != height ($height)');
     }
@@ -102,6 +127,22 @@ class PngEncode {
       }
       if (bits > 0) raw[offset] = current << (8 - bits);
     }
+    return raw;
+  }
+
+  /// Inverts packed 1-bit rows to DeviceGray polarity (0 = black,
+  /// 1 = white) and zeroes the pad bits past each row's width.
+  /// With [dark] the inversion is skipped, so the packed bits are the
+  /// module bits themselves: black modules render white, white black.
+  /// The pad-bit mask must run AFTER the inversion: inversion turns
+  /// the zero pad bits into ones, which would otherwise render as a
+  /// white fringe at each row's right edge.
+  static void _invertAndMask(
+    Uint8List raw,
+    int width,
+    int height, {
+    bool dark = false,
+  }) {
     // PNG greyscale / DeviceGray: 0 = black, 1 = white — invert our
     // 1 = black modules. Skipped for dark pages (see [deflate1Bit]).
     if (!dark) {
@@ -110,6 +151,7 @@ class PngEncode {
       }
     }
     // Pad bits past the row width must be zero after inversion.
+    final stride = (width + 7) ~/ 8;
     final padBits = stride * 8 - width;
     if (padBits > 0) {
       final mask = 0xFF << padBits & 0xFF;
@@ -117,6 +159,21 @@ class PngEncode {
         raw[y * stride + stride - 1] &= mask;
       }
     }
+  }
+
+  /// Packs [rows] of 0/1 modules into bytes, MSB first, then inverts to
+  /// DeviceGray polarity (0 = black, 1 = white). Pad bits past the row
+  /// width are zero. No filter bytes — callers add them if needed.
+  /// With [dark] the inversion is skipped, so the packed bits are the
+  /// module bits themselves: black modules render white, white black.
+  static Uint8List _packAndInvert(
+    List<Uint8List> rows,
+    int width,
+    int height, {
+    bool dark = false,
+  }) {
+    final raw = _packRows(rows, width, height);
+    _invertAndMask(raw, width, height, dark: dark);
     return raw;
   }
 

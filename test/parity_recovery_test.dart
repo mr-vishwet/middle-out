@@ -113,13 +113,14 @@ void main() {
   });
 
   test('equal-split: lose a middle frame, parity rebuilds it', () {
-    // 200 KiB random -> 4 dense data frames + 2 parity. Losing data
-    // frame 1 (trio A) must rebuild to the exact chunk size.
+    // 200 KiB random -> 4 dense data frames + 2 parity (explicit
+    // 64 KiB unit: the default adaptive rule gives 1 page for 200 KiB).
+    // Losing data frame 1 (trio A) must rebuild to the exact chunk size.
     final random = Random(7);
     final data = Uint8List.fromList(
       List<int>.generate(200 * 1024, (_) => random.nextInt(256)),
     );
-    final result = Encoder.encode(data);
+    final result = Encoder.encode(data, maxPayload: 64 * 1024);
     expect(result.frames.where((f) => f.isData).length, 4);
     final blobs = blobsOf(result);
     // Frame list order is group order: data frames first.

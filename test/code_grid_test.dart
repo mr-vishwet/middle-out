@@ -183,10 +183,12 @@ void main() {
       expect((fbw, fbh), (1776, 314));
     });
 
-    test('chooseGridSize sizes big equal-split frames (cap 32768)', () {
-      // A 5 MB frame needs h ~ 5,450; a 50 MB frame h ~ 16,800 — both
-      // far above the old 4,096 cap. Sizing is pure arithmetic, so
-      // these checks cost nothing.
+    test('chooseGridSize sizes big equal-split frames (cap 131072)', () {
+      // A 5 MB frame needs h ~ 5,600; a 50 MB frame h ~ 16,800; a
+      // 10.5 MB frame (the densest page of a 20 MB encode) h ~ 7,880
+      // and a 77 MB frame (the densest page of a 1 GB encode)
+      // h ~ 21,300 — all far below the cap. Sizing is pure arithmetic,
+      // so these checks cost nothing.
       final (_, h5) = CodeGrid.chooseGridSize(5 * 1024 * 1024);
       expect(h5, greaterThan(5000));
       expect(h5, lessThan(6000));
@@ -194,15 +196,77 @@ void main() {
       expect(h50, greaterThan(15000));
       expect(h50, lessThan(19000));
       expect(h50, lessThanOrEqualTo(CodeGrid.maxHeight));
+      // Exact dims for the dense pages the adaptive rule produces
+      // (frame bytes = chunk + 100-byte header + 4-byte CRC).
+      expect(CodeGrid.chooseGridSize(11010048), (11419, 8074));
+      expect(CodeGrid.chooseGridSize(10485869), (11144, 7880));
+      expect(CodeGrid.chooseGridSize(76695949), (30133, 21306));
+      // A 358 MB frame (the densest page of a 10 GB encode) needs
+      // h ~ 46,000 — over the old 32,768 cap, under the new one.
+      final (w358, h358) = CodeGrid.chooseGridSize(357914046);
+      expect((w358, h358), (65093, 46026));
+      expect(h358, lessThanOrEqualTo(CodeGrid.maxHeight));
     });
 
     test('chooseGridSize throws past the cap', () {
-      // A 200 MB frame needs more than the 32,768-row cap allows
-      // (~181 MB at QR aspect).
+      // A 4 GB frame needs more than the 131,072-row cap allows
+      // (~2.9 GB at QR aspect).
       expect(
-        () => CodeGrid.chooseGridSize(200 * 1024 * 1024),
+        () => CodeGrid.chooseGridSize(4 * 1024 * 1024 * 1024),
         throwsA(isA<Exception>()),
       );
+    });
+  });
+
+  group('streaming packGrid', () {
+    test('packGrid bits equal buildGrid bits (QR + barcode, light + dark)',
+        () {
+      // packGrid is the single bit-layout implementation; buildGrid
+      // unpacks it. If the two ever disagree, the grid layout has two
+      // sources of truth — fail loudly. The deflate bytes must agree
+      // too, in both polarities, or the PDF builder (packGrid path)
+      // and the previews (buildGrid path) would render different pages.
+      final random = Random(99);
+      for (final size in [0, 10, 100, 1024, 64 * 1024, 200 * 1024]) {
+        final payload = Uint8List.fromList(
+          List<int>.generate(size, (_) => random.nextInt(256)),
+        );
+        for (final aspect in [
+          CodeGrid.qrAspect,
+          CodeGrid.barcodeAspect,
+          1.0,
+        ]) {
+          final packed = CodeGrid.packGrid(payload, aspect: aspect);
+          final grid = CodeGrid.buildGrid(payload, aspect: aspect);
+          expect(packed.width, grid[0].length);
+          expect(packed.height, grid.length);
+          final stride = (packed.width + 7) ~/ 8;
+          for (var r = 0; r < packed.height; r++) {
+            final row = Uint8List(packed.width);
+            for (var c = 0; c < packed.width; c++) {
+              row[c] =
+                  (packed.bytes[r * stride + c ~/ 8] >> (7 - c % 8)) & 1;
+            }
+            expect(row, grid[r]);
+          }
+          for (final dark in [false, true]) {
+            expect(
+              PngEncode.deflatePacked(
+                packed.bytes,
+                packed.width,
+                packed.height,
+                dark: dark,
+              ),
+              PngEncode.deflate1Bit(
+                grid,
+                packed.width,
+                packed.height,
+                dark: dark,
+              ),
+            );
+          }
+        }
+      }
     });
   });
 

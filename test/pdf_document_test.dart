@@ -9,8 +9,9 @@ import 'package:middle_out/codec/encoder.dart';
 import 'package:middle_out/codec/pdf_document.dart';
 import 'package:middle_out/services/pdf_frame_extractor.dart';
 
-/// Incompressible bytes: 200 KiB of seeded random data encodes to 4 equal
-/// data frames + 2 parity = 6 frames, enough to observe per-frame progress.
+/// Incompressible bytes: 200 KiB of seeded random data encodes to 1 dense
+/// data frame + 1 parity = 2 frames under the default adaptive rule
+/// (dataPageCount: 200 KiB < 15 MiB), enough to observe per-frame progress.
 Uint8List randomBytes(int length) {
   final random = Random(42);
   return Uint8List.fromList(
@@ -82,7 +83,11 @@ void main() {
 
     test('stops promptly when shouldCancel is set', () async {
       final data = randomBytes(200 * 1024);
-      final encoded = Encoder.encode(data);
+      // Explicit 64 KiB unit forces 6 frames: cancellation must stop
+      // the build mid-loop, which needs more frames than the 2 the
+      // default adaptive rule gives for 200 KiB (cancel fires on the
+      // 2nd progress call, so frames.length must exceed 2).
+      final encoded = Encoder.encode(data, maxPayload: 64 * 1024);
       var calls = 0;
       await expectLater(
         PdfDocument.build(
@@ -124,7 +129,7 @@ void main() {
       expect(ops.contains('(Original size:'), isTrue);
       expect(ops.contains('(Format: QR-style grid)'), isTrue);
       expect(ops.contains('(Theme: Light)'), isTrue);
-      expect(ops.contains('(Pages: 7)'), isTrue);
+      expect(ops.contains('(Pages: 3)'), isTrue);
       expect(ops.contains('(Scan to open the Middle Out app.)'), isTrue);
       // No secrets on the cover.
       expect(ops.contains('SHA-256'), isFalse);

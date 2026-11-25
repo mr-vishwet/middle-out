@@ -1,9 +1,12 @@
 
+import 'dart:async' show unawaited;
+
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 
+import '../codec/code_grid.dart';
 import '../codec/decoder.dart';
 import '../codec/encoder.dart';
 import '../codec/erasure.dart';
@@ -11,6 +14,7 @@ import '../codec/frame.dart';
 import '../codec/pdf_document.dart';
 import '../codec/streaming_encoder.dart';
 import '../core/constants.dart';
+import '../core/format.dart';
 import '../services/file_picker_service.dart';
 import '../services/file_reader.dart';
 import '../services/file_saver.dart' show saveFileBytes;
@@ -48,14 +52,24 @@ enum EncodePhase {
 ///
 /// The ratio is the worst (lowest) across the samples, extrapolated; the
 /// UI labels it an estimate. Real ratios depend entirely on the input.
+///
+/// The PDF size is modelled from MEASURED real builds (see
+/// [EncodeController.pdfSizeModel]), not from a per-frame guess: every
+/// code page is a 1-bit image whose deflated bytes track the frame bytes
+/// it carries, plus a fixed per-page PDF-object cost and a fixed
+/// cover/document cost.
 class EncodeEstimate {
   /// Creates an estimate.
   const EncodeEstimate({
     required this.ratio,
     required this.estimatedFrames,
+    required this.dataFrames,
+    required this.parityFrames,
     required this.estimatedPdfBytes,
     required this.estimatedSeconds,
     required this.sampleBytes,
+    required this.memoryGuard,
+    this.incompressible = false,
     this.overCap = false,
   });
 
@@ -64,6 +78,12 @@ class EncodeEstimate {
 
   /// Estimated frame count (data + parity).
   final int estimatedFrames;
+
+  /// Estimated DATA frames (code pages carrying file bytes).
+  final int dataFrames;
+
+  /// Estimated PARITY frames (XOR recovery pages).
+  final int parityFrames;
 
   /// Estimated PDF size in bytes.
   final int estimatedPdfBytes;
@@ -74,9 +94,51 @@ class EncodeEstimate {
   /// Bytes sampled for the estimate.
   final int sampleBytes;
 
+  /// Memory guard verdict for this encode (peak estimate + level).
+  final MemoryGuard memoryGuard;
+
+  /// True when the measured ratio says the file barely compresses
+  /// (ratio below [EncodeController.incompressibleRatioThreshold]):
+  /// the PDF will be about the same size as the file, or bigger.
+  final bool incompressible;
+
   /// True when the estimated frame count exceeds [kMaxFrames] — the
   /// estimate screen warns before the user encodes.
   final bool overCap;
+}
+
+/// How much memory an encode is expected to need.
+enum MemoryGuardLevel {
+  /// Expected peak is comfortably inside the platform budget.
+  ok,
+
+  /// Expected peak is high: the user must confirm before encoding.
+  warn,
+
+  /// Expected peak exceeds what the platform can safely hold:
+  /// the encode is blocked until the file is split smaller.
+  refuse,
+}
+
+/// The memory guard's verdict for one estimate.
+class MemoryGuard {
+  /// Creates a memory guard verdict.
+  const MemoryGuard({
+    required this.estimatedPeakBytes,
+    required this.level,
+    required this.reason,
+  });
+
+  /// Estimated peak memory in bytes (see
+  /// [EncodeController.estimateMemoryPeak] for the model).
+  final int estimatedPeakBytes;
+
+  /// The guard level: proceed, confirm, or block.
+  final MemoryGuardLevel level;
+
+  /// Human-readable reason, shown on the estimate screen when the
+  /// level is not [MemoryGuardLevel.ok].
+  final String reason;
 }
 
 /// State for the encode flow: picked file, toggles, progress, result.
@@ -101,37 +163,320 @@ class EncodeController extends ChangeNotifier {
   /// middle and tail — for 768 KiB total.
   static const int estimateSampleChunkBytes = 256 * 1024;
 
+  // --- Honest PDF-size model (measured, not guessed) -------------------
+  //
+  // Measured from real builds (VM, light + dark samples + builds of a
+  // 1 MiB highly-compressible demo, a 2 MiB random file and a 20 MiB
+  // random file, QR and barcode, encrypted and plain; see the
+  // measurement notes in the repo history for this change):
+  //
+  // * A code page is a 1-bit image XObject. Its deflated bytes track the
+  //   frame bytes it carries: the packed 1-bit pixels are exactly
+  //   `packedRaw` bytes (stride x height, from [CodeGrid.chooseGridSize]
+  //   — computed, never guessed), and deflate recovers most of the
+  //   reserved-cell overhead, leaving ~0.99x packed bytes for random
+  //   frame bytes plus ~96 bytes of per-stream zlib overhead.
+  // * When the payload is NOT encrypted, the frame bytes are the zlib-9
+  //   stream itself, which deflate-6 can squeeze again: [secondPassFactor]
+  //   (measured on the samples: deflate-6(zlib-9(sample)) / len) scales
+  //   the deflate down. When encrypted, ChaCha20 output is uniformly
+  //   random, so the factor is 1.0 no matter how compressible the input
+  //   was — encryption is why the default path is accurate even for
+  //   text files.
+  // * Fixed costs: 478 bytes of document scaffolding (header, Catalog,
+  //   Pages, two standard-14 fonts, xref/trailer base), 2,814 for the
+  //   shared logo XObject, 1,098 for the cover page (objects + QR
+  //   image), 790 per code page (Page + Contents + Image objects +
+  //   xref entries).
+  //
+  // Verified against real builds (encrypted, the default): demo
+  // 21,137 actual vs ~21,350 model (+1.0%); 2 MiB random (1 data page)
+  // 4,216,281 vs ~4,358,000 (+3.4%); 20 MiB random (2 data pages)
+  // 31,526,784 vs ~32,608,000 (+3.4%). The model is deliberately
+  // conservative — it over-states by a few percent, never under-states
+  // an incompressible file.
+  //
+  // KNOWN MISS (documented, not hidden): an UNENCRYPTED highly
+  // compressible file over-states by ~45% (demo: model ~13,400 vs
+  // 9,089 actual). The 256 KiB samples cannot see long-range
+  // repetition: the second-pass output of README x461 is ~1.3 KB
+  // whether it describes 256 KiB or the whole 1 MiB, so the sample
+  // factor (0.47) is far above the whole-file factor (0.18). The error
+  // is in the safe direction (over, never under) and vanishes the
+  // moment encryption is on, which is the default.
+  /// Fixed document scaffolding (header, Catalog, Pages, two
+  /// standard-14 fonts, xref/trailer base), in bytes.
+  static const int kPdfFixedBytes = 478;
+
+  /// Shared logo XObject (deflated logo + dict/wrapper/xref), bytes.
+  static const int kPdfLogoBytes = 2814;
+
+  /// Cover page (page objects + QR image + xref), in bytes.
+  static const int kPdfCoverBytes = 1098;
+
+  /// Per code page (Page + Contents + Image objects + xref), bytes.
+  static const int kPdfPerFrameBytes = 790;
+
+  /// Fraction of the packed 1-bit image that survives deflate-6 for
+  /// random frame bytes (measured 0.955–0.987; 0.99 is the
+  /// conservative end).
+  static const double kDeflateRecovery = 0.99;
+
+  /// Fixed per-frame zlib stream overhead, in bytes (measured: tiny
+  /// frames deflate to ~96 bytes over the recovered packed size).
+  static const int kDeflatePerFrameSlopBytes = 96;
+
+  /// Frame wire overhead: 100-byte header + 4-byte payload CRC.
+  static const int kFrameWireBytes = kHeaderSize + 4;
+
+  /// Ratio below which a file counts as incompressible: zlib saved
+  /// less than ~9%, so the PDF cannot come out meaningfully smaller
+  /// than the file.
+  static const double incompressibleRatioThreshold = 1.1;
+
+  // --- Memory guard (new renderer model) -------------------------------
+  //
+  // The renderer streams grid rows into packed 1-bit bytes, so a code
+  // page costs O(image bytes), not O(cells). Per-page peak is the
+  // largest page's packed image times [kImageBuildFactor]. MEASURED
+  // on the new renderer (VM, 10.5 MB page): packed 11.0 MB, deflate
+  // 10.5 MB, peak-RSS delta +58.4 MB = 5.45x packed — the live packed
+  // + deflate buffers (~21.5 MB) plus per-call garbage (BytesBuilder
+  // growth, the DeviceGray inversion copy, zlib working set, GC
+  // retention). 6.0 is the rounded-up guard value.
+  //
+  // On top of the transient page, the build holds: the input file and
+  // the compressed stream (in-memory path only — streaming reads off
+  // disk), the parity frames (fresh allocations; data frames are views
+  // into the stream), and the PDF output-so-far. The writer is eager
+  // (each page is serialised as it is built and its image buffers are
+  // dropped), but the output bytes themselves still accumulate — the
+  // PDF is returned as bytes, so one full copy is unavoidable. Only a
+  // future file sink would drop that last copy ([streamingBinding]).
+  //
+  // Thresholds: desktop native warns above 1 GiB and refuses above
+  // 2 GiB (a desktop app targets machines with >= 8 GB; 2 GiB
+  // approaches practical Dart-heap limits). Web and mobile warn above
+  // 512 MiB and refuse above 1 GiB (browser tabs and mobile apps are
+  // killed far earlier — iOS jetsam, Android low-memory killer — and
+  // web never streams: the whole file is held in memory).
+  /// Transient per-page build factor over the largest page's packed
+  /// image bytes — measured 5.45x peak RSS on a 10.5 MB page, rounded
+  /// up to 6.0 (see the memory guard comment above).
+  static const double kImageBuildFactor = 6.0;
+
+  /// Memory-guard warn threshold on desktop native, in bytes.
+  static const int kMemoryWarnDesktopBytes = 1024 * 1024 * 1024;
+
+  /// Memory-guard refuse threshold on desktop native, in bytes.
+  static const int kMemoryRefuseDesktopBytes = 2 * 1024 * 1024 * 1024;
+
+  /// Memory-guard warn threshold on web and mobile, in bytes.
+  static const int kMemoryWarnSmallBytes = 512 * 1024 * 1024;
+
+  /// Memory-guard refuse threshold on web and mobile, in bytes.
+  static const int kMemoryRefuseSmallBytes = 1024 * 1024 * 1024;
+
   /// Builds an estimate from a measured compression [ratio] and file
   /// size. Pure (no I/O) so the frame-count and cap math is unit-testable.
   ///
-  /// In-memory encodes equal-split: at most [kMaxDataPages] data frames
-  /// (so the frame count never exceeds 28 and the cap never binds).
-  /// [streaming] encodes use fixed [kDefaultMaxPayload] chunks instead
-  /// and CAN exceed the cap. Parity counts one per non-empty trio in
-  /// both paths. The PDF estimate is the compressed bytes plus per-frame
-  /// overhead: a 1-bit code image is about the size of its frame.
+  /// In-memory encodes use the adaptive page rule
+  /// ([Encoder.dataPageCount]): the compressed stream is equal-split
+  /// across that many data pages, so the frame count follows the rule,
+  /// not a fixed target. [streaming] encodes use fixed
+  /// [kDefaultMaxPayload] chunks instead and CAN exceed the cap.
+  /// Parity counts one per non-empty trio in both paths.
+  ///
+  /// [barcode] selects the bar-grid aspect for the packed-image size;
+  /// [encrypted] selects the deflate factor (encrypted payloads are
+  /// random, so they never re-compress); [secondPassFactor] is the
+  /// measured deflate-6(zlib-9(sample)) ratio for plain payloads.
+  /// [web]/[mobile] select the memory-guard thresholds;
+  /// [streamingBinding] says the PDF output goes to a file sink
+  /// instead of accumulating in memory (false: the writer is eager
+  /// but still returns the whole PDF as bytes, so one full copy is
+  /// held; the sink does not exist yet).
   static EncodeEstimate estimateFor({
     required int fileSize,
     required double ratio,
     required int sampleBytes,
     bool streaming = false,
+    bool barcode = false,
+    bool encrypted = true,
+    double secondPassFactor = 1.0,
+    bool web = false,
+    bool mobile = false,
+    bool streamingBinding = false,
   }) {
     final clampedRatio = ratio.clamp(1.0, 1000.0);
     final estCompressed = (fileSize / clampedRatio).ceil();
-    final rawDataFrames =
-        (estCompressed + kDefaultMaxPayload - 1) ~/ kDefaultMaxPayload;
-    final dataFrames = streaming
-        ? (rawDataFrames < 1 ? 1 : rawDataFrames)
-        : rawDataFrames.clamp(1, kMaxDataPages);
-    final frames = dataFrames + Erasure.parityFrameCount(dataFrames);
+    final int dataFrames;
+    final int chunkSize;
+    if (streaming) {
+      dataFrames = (estCompressed + kDefaultMaxPayload - 1) ~/
+          kDefaultMaxPayload;
+      chunkSize = kDefaultMaxPayload;
+    } else {
+      dataFrames = Encoder.dataPageCount(estCompressed);
+      chunkSize = (estCompressed + dataFrames - 1) ~/ dataFrames;
+    }
+    final dataFramesClamped = dataFrames < 1 ? 1 : dataFrames;
+    final parityFrames = Erasure.parityFrameCount(dataFramesClamped);
+    final frames = dataFramesClamped + parityFrames;
+    final estimatedPdfBytes = _estimatePdfBytes(
+      dataFrames: dataFramesClamped,
+      parityFrames: parityFrames,
+      chunkSize: chunkSize,
+      barcode: barcode,
+      encrypted: encrypted,
+      secondPassFactor: secondPassFactor,
+    );
+    final memoryGuard = estimateMemoryPeak(
+      fileSize: fileSize,
+      estCompressed: estCompressed,
+      dataFrames: dataFramesClamped,
+      parityFrames: parityFrames,
+      chunkSize: chunkSize,
+      estimatedPdfBytes: estimatedPdfBytes,
+      streaming: streaming,
+      barcode: barcode,
+      web: web,
+      mobile: mobile,
+      streamingBinding: streamingBinding,
+    );
     return EncodeEstimate(
       ratio: clampedRatio,
       estimatedFrames: frames,
-      estimatedPdfBytes: estCompressed + frames * 2000 + 20000,
+      dataFrames: dataFramesClamped,
+      parityFrames: parityFrames,
+      estimatedPdfBytes: estimatedPdfBytes,
       estimatedSeconds:
           (fileSize / (25 * 1024 * 1024)).ceil().clamp(1, 3600 * 24),
       sampleBytes: sampleBytes,
+      memoryGuard: memoryGuard,
+      incompressible: clampedRatio < incompressibleRatioThreshold,
       overCap: frames > kMaxFrames,
+    );
+  }
+
+  /// The PDF-size model, factored out so tests can check it directly:
+  /// fixed document + logo + cover costs, per-frame page objects, and
+  /// per-frame deflated 1-bit images sized from the real grid geometry.
+  static int _estimatePdfBytes({
+    required int dataFrames,
+    required int parityFrames,
+    required int chunkSize,
+    required bool barcode,
+    required bool encrypted,
+    required double secondPassFactor,
+  }) {
+    final frames = dataFrames + parityFrames;
+    final frameBytes = chunkSize + kFrameWireBytes;
+    // Packed 1-bit image bytes for one frame: exact grid geometry.
+    // A chunk too large for one grid (over CodeGrid.maxHeight) cannot
+    // be rendered at all — fall back to the large-grid packing ratio
+    // (~1.05x: the centre tile dominates) so the estimate stays finite;
+    // the memory guard refuses such an encode outright.
+    int packedRaw;
+    try {
+      final (w, h) = CodeGrid.chooseGridSize(
+        frameBytes,
+        aspect: barcode ? CodeGrid.barcodeAspect : CodeGrid.qrAspect,
+      );
+      packedRaw = ((w + 7) ~/ 8) * h;
+    } on CodecException {
+      packedRaw = (frameBytes * 105) ~/ 100;
+    }
+    // Encrypted payloads are random: no second-pass squeeze. Plain
+    // payloads re-compress by the measured sample factor (clamped —
+    // a factor above ~1.05 would mean the sample misled us).
+    final secondPass =
+        encrypted ? 1.0 : secondPassFactor.clamp(0.0, 1.05);
+    final deflatePerFrame =
+        (packedRaw * kDeflateRecovery * secondPass).ceil() +
+            kDeflatePerFrameSlopBytes;
+    return kPdfFixedBytes +
+        kPdfLogoBytes +
+        kPdfCoverBytes +
+        frames * (kPdfPerFrameBytes + deflatePerFrame);
+  }
+
+  /// Estimates the peak memory of an encode and returns the guard
+  /// verdict. Pure, so the thresholds are unit-testable.
+  ///
+  /// Peak = held input (file + compressed stream on the in-memory
+  /// path; nothing on the streaming path) + parity frames (fresh
+  /// allocations; data frames are views into the stream) + the
+  /// transient largest page image x [kImageBuildFactor] + held PDF
+  /// output (the whole PDF — the eager writer still accumulates the
+  /// returned bytes; only a file sink, [streamingBinding], drops this
+  /// to one page). A chunk that cannot fit one code grid refuses
+  /// outright — no estimate of the peak can save it.
+  static MemoryGuard estimateMemoryPeak({
+    required int fileSize,
+    required int estCompressed,
+    required int dataFrames,
+    required int parityFrames,
+    required int chunkSize,
+    required int estimatedPdfBytes,
+    required bool streaming,
+    required bool barcode,
+    required bool web,
+    required bool mobile,
+    required bool streamingBinding,
+  }) {
+    final frameBytes = chunkSize + kFrameWireBytes;
+    int largestPageImageBytes;
+    try {
+      final (w, h) = CodeGrid.chooseGridSize(
+        frameBytes,
+        aspect: barcode ? CodeGrid.barcodeAspect : CodeGrid.qrAspect,
+      );
+      largestPageImageBytes = ((w + 7) ~/ 8) * h;
+    } on CodecException {
+      return MemoryGuard(
+        estimatedPeakBytes: -1,
+        level: MemoryGuardLevel.refuse,
+        reason: 'A single code page cannot hold $chunkSize bytes — '
+            'split the file into smaller files and encode each one '
+            'separately.',
+      );
+    }
+    final transientPage =
+        (largestPageImageBytes * kImageBuildFactor).ceil();
+    final heldParity = parityFrames * chunkSize;
+    final heldInput = streaming ? 0 : fileSize + estCompressed;
+    final heldImages =
+        streamingBinding ? largestPageImageBytes : estimatedPdfBytes;
+    final peak = heldInput + heldParity + transientPage + heldImages;
+    final smallPlatform = web || mobile;
+    final warnAt =
+        smallPlatform ? kMemoryWarnSmallBytes : kMemoryWarnDesktopBytes;
+    final refuseAt = smallPlatform
+        ? kMemoryRefuseSmallBytes
+        : kMemoryRefuseDesktopBytes;
+    if (peak > refuseAt) {
+      return MemoryGuard(
+        estimatedPeakBytes: peak,
+        level: MemoryGuardLevel.refuse,
+        reason: 'This encode would need about ${formatBytes(peak)} of '
+            'memory — more than this device can safely hold. Split the '
+            'file into smaller files and encode each one separately.',
+      );
+    }
+    if (peak > warnAt) {
+      return MemoryGuard(
+        estimatedPeakBytes: peak,
+        level: MemoryGuardLevel.warn,
+        reason: 'This encode may peak at about ${formatBytes(peak)} of '
+            'memory. Tap Encode again to proceed, or split the file '
+            'first if this device is low on memory.',
+      );
+    }
+    return MemoryGuard(
+      estimatedPeakBytes: peak,
+      level: MemoryGuardLevel.ok,
+      reason: '',
     );
   }
 
@@ -170,6 +515,19 @@ class EncodeController extends ChangeNotifier {
 
   /// Pre-encode estimate, refreshed when a file is picked.
   EncodeEstimate? estimate;
+
+  /// True once the user has acknowledged a memory-guard warning for
+  /// the current estimate (two-tap encode: the first tap on Encode
+  /// acknowledges, the second starts the encode). Reset whenever the
+  /// estimate is recomputed, so a new file or toggle change asks again.
+  bool memoryWarningAcknowledged = false;
+
+  /// Records the user's acknowledgement of the memory warning for the
+  /// current estimate, so the next Encode tap starts the encode.
+  void acknowledgeMemoryWarning() {
+    memoryWarningAcknowledged = true;
+    notifyListeners();
+  }
 
   /// True when the last encode ran through the streaming encoder.
   bool streamed = false;
@@ -230,11 +588,13 @@ class EncodeController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Sets the code format.
+  /// Sets the code format. The estimate depends on it (bar-grid
+  /// geometry), so it is recomputed.
   void setBarcode(bool value) {
     barcode = value;
     _clearStaleError();
     notifyListeners();
+    if (file != null) unawaitedRefreshEstimate();
   }
 
   /// Sets the PDF theme (false = light, true = dark).
@@ -244,11 +604,14 @@ class EncodeController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Sets the encryption toggle.
+  /// Sets the encryption toggle. The estimate depends on it (an
+  /// encrypted payload is random bytes, so it never re-compresses in
+  /// the PDF images), so it is recomputed.
   void setEncrypted(bool value) {
     encrypted = value;
     _clearStaleError();
     notifyListeners();
+    if (file != null) unawaitedRefreshEstimate();
   }
 
   /// Sets the passphrase.
@@ -301,24 +664,40 @@ class EncodeController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Fire-and-forget estimate refresh after a toggle change (the
+  /// barcode and encryption toggles change the PDF size and the memory
+  /// guard, so the estimate must follow them). [refreshEstimate]
+  /// notifies when it lands.
+  void unawaitedRefreshEstimate() {
+    unawaited(refreshEstimate());
+  }
+
   /// (Re)computes the pre-encode estimate from head, middle and tail
   /// samples, using the worst (lowest) ratio across them. A head-only
   /// sample undershoots badly on media files: an .mp4's metadata head
   /// compresses far better than its video data. Conservative beats
   /// optimistic — an over-estimate only warns early, an under-estimate
   /// fails the encode halfway through.
+  ///
+  /// Each sample is also deflated a second time (deflate-6 of its
+  /// zlib-9 bytes): that is the [EncodeController.estimateFor]
+  /// second-pass factor, the most the PDF images can squeeze a plain
+  /// (unencrypted) payload again. The worst (largest) factor across
+  /// samples is used, so the PDF size is never under-stated by it.
   Future<void> refreshEstimate() async {
     final current = file;
     if (current == null) {
       estimate = null;
       return;
     }
+    memoryWarningAcknowledged = false;
     try {
       final samples = await _picker.readRefSamples(
         current,
         estimateSampleChunkBytes,
       );
       var ratio = double.infinity;
+      var secondPassFactor = 0.0;
       var sampled = 0;
       for (final sample in samples) {
         if (sample.isEmpty) continue;
@@ -327,9 +706,20 @@ class EncodeController extends ChangeNotifier {
             ? 1.0
             : sample.length / compressed.length;
         if (sampleRatio < ratio) ratio = sampleRatio;
+        // Second pass: how much does the compressed sample squeeze
+        // again at the level the PDF builder uses (6)?
+        final recompressed = const ZLibEncoder().encode(
+          compressed,
+          level: 6,
+        );
+        final factor = compressed.isEmpty
+            ? 1.0
+            : recompressed.length / compressed.length;
+        if (factor > secondPassFactor) secondPassFactor = factor;
         sampled += sample.length;
       }
       if (ratio.isInfinite) ratio = 1.0;
+      if (secondPassFactor == 0.0) secondPassFactor = 1.0;
       // Streaming encodes (large native files) frame in fixed 64 KiB
       // chunks, so their frame count follows the streaming rule; the
       // in-memory path equal-splits. Same routing as [encode].
@@ -341,6 +731,12 @@ class EncodeController extends ChangeNotifier {
         ratio: ratio,
         sampleBytes: sampled,
         streaming: willStream,
+        barcode: barcode,
+        encrypted: encrypted,
+        secondPassFactor: secondPassFactor,
+        web: kIsWeb,
+        mobile: defaultTargetPlatform == TargetPlatform.iOS ||
+            defaultTargetPlatform == TargetPlatform.android,
       );
     } catch (_) {
       estimate = null;
@@ -494,6 +890,7 @@ class EncodeController extends ChangeNotifier {
     progress = 0;
     progressLabel = '';
     estimate = null;
+    memoryWarningAcknowledged = false;
     streamed = false;
     result = null;
     pdfBytes = null;
